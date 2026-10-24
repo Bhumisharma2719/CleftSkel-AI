@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#f6f8fb" />
+  <title>CLEFTSKEL-AI | Cephalometric Analysis</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: { ink: '#17253f', muted: '#71809a', teal: '#137c8b', canvas: '#f6f8fb' }, boxShadow: { card: '0 12px 40px rgba(23,37,63,.06)' } } } };
+  </script>
+  <style>
+    body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .drop-active { border-color: #137c8b; background: #effafb; }
+  </style>
+</head>
+<body class="min-h-screen bg-canvas text-ink">
+  <header class="border-b border-slate-200/80 bg-white">
+    <div class="mx-auto flex max-w-7xl items-center justify-between px-5 py-4 sm:px-8">
+      <a href="#" class="flex items-center gap-3" aria-label="CLEFTSKEL-AI home">
+        <span class="grid h-10 w-10 place-items-center rounded-xl bg-teal text-white">
+          <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v18M4.5 7.5l15 9m0-9-15 9"/><circle cx="12" cy="12" r="9"/></svg>
+        </span>
+        <span><span class="block text-base font-bold tracking-tight">CLEFTSKEL<span class="text-teal">-AI</span></span><span class="block text-xs text-muted">Cephalometric analysis</span></span>
+      </a>
+      <div class="flex items-center gap-2 rounded-full bg-slate-50 px-3 py-2 text-xs font-medium text-muted"><span id="api-dot" class="h-2 w-2 rounded-full bg-amber-400"></span><span id="api-status">Checking API</span></div>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-7xl px-5 py-9 sm:px-8 sm:py-12">
+    <div class="mb-8 max-w-2xl">
+      <p class="mb-2 text-xs font-bold uppercase tracking-[.16em] text-teal">Clinical workspace</p>
+      <h1 class="text-3xl font-bold tracking-tight sm:text-4xl">Lateral cephalogram analysis</h1>
+      <p class="mt-3 text-sm leading-6 text-muted sm:text-base">Upload a cephalometric X-ray to review skeletal age and cervical vertebral assessment.</p>
+    </div>
+
+    <div class="grid gap-6 lg:grid-cols-[1.05fr_.95fr]">
+      <section class="rounded-2xl border border-slate-200 bg-white p-5 shadow-card sm:p-7">
+        <div class="mb-5 flex items-start justify-between gap-3">
+          <div><h2 class="font-semibold">Upload X-ray</h2><p class="mt-1 text-sm text-muted">JPEG, PNG, or WebP · up to 15 MB</p></div>
+          <span class="rounded-full bg-teal/10 px-3 py-1 text-xs font-semibold text-teal">Lateral cephalogram</span>
+        </div>
+        <input id="file-input" type="file" accept="image/jpeg,image/png,image/webp" class="sr-only" />
+        <button id="drop-zone" type="button" class="group flex min-h-64 w-full flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50/70 px-5 text-center transition hover:border-teal/60 hover:bg-teal/[.03] focus:outline-none focus:ring-4 focus:ring-teal/10" aria-label="Choose an X-ray image or drop one here">
+          <span class="mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-white text-teal shadow-sm ring-1 ring-slate-100"><svg viewBox="0 0 24 24" class="h-7 w-7" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5a1 1 0 001 1h12a1 1 0 001-1v-5"/></svg></span>
+          <span class="font-semibold">Drop your X-ray image here</span><span class="mt-1 text-sm text-muted">or <span class="font-semibold text-teal">browse files</span></span>
+          <span id="file-name" class="mt-4 hidden max-w-full truncate rounded-lg bg-white px-3 py-2 text-sm font-medium text-ink ring-1 ring-slate-200"></span>
+        </button>
+        <p id="error-message" class="mt-3 hidden text-sm text-rose-600" role="alert"></p>
+        <button id="analyze-button" type="button" disabled class="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-teal px-5 py-3.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#0d6875] disabled:cursor-not-allowed disabled:bg-slate-300">
+          <svg id="button-spinner" class="hidden h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" opacity=".25"/><path d="M21 12a9 9 0 00-9-9" stroke="currentColor" stroke-width="3"/></svg>
+          <span id="button-label">Analyze X-ray</span>
+          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+        </button>
+        <p class="mt-3 text-center text-xs text-muted">For research and clinician review. This prototype does not provide a diagnosis.</p>
+      </section>
+
+      <section class="rounded-2xl border border-slate-200 bg-white p-5 shadow-card sm:p-7" aria-live="polite">
+        <div class="mb-5"><h2 class="font-semibold">Analysis results</h2><p class="mt-1 text-sm text-muted">Your image and model output will appear here.</p></div>
+        <div id="preview-empty" class="grid min-h-48 place-items-center rounded-xl bg-slate-50 text-center text-sm text-muted"><div><svg class="mx-auto mb-3 h-9 w-9 text-slate-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9" r="1.5"/><path d="m21 15-5-5L5 20"/></svg>Image preview will appear here</div></div>
+        <div id="preview-wrap" class="hidden overflow-hidden rounded-xl bg-slate-950"><img id="preview" alt="Uploaded lateral cephalogram preview" class="max-h-72 w-full object-contain" /></div>
+        <div class="mt-5 grid gap-3 sm:grid-cols-2">
+          <div class="rounded-xl border border-slate-100 bg-slate-50/80 p-4"><p class="text-xs font-medium text-muted">Predicted skeletal age</p><p id="age-result" class="mt-2 text-xl font-bold">— <span class="text-sm font-medium text-muted">years</span></p></div>
+          <div class="rounded-xl border border-slate-100 bg-slate-50/80 p-4"><p class="text-xs font-medium text-muted">CVM stage</p><p id="cva-result" class="mt-2 text-base font-bold">Awaiting analysis</p></div>
+        </div>
+        <div id="result-note" class="mt-4 hidden rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-5 text-amber-900"></div>
+        <p id="result-status" class="mt-3 text-xs text-muted">Upload an image to get started.</p>
+      </section>
+    </div>
+  </main>
+  <footer class="mx-auto max-w-7xl px-5 pb-8 text-xs text-muted sm:px-8">CLEFTSKEL-AI · Prototype interface</footer>
+
+  <script>
+    // Change this if your FastAPI server runs on a different host or port.
+    const API_BASE = 'http://127.0.0.1:8000';
+    const fileInput = document.querySelector('#file-input');
+    const dropZone = document.querySelector('#drop-zone');
+    const analyzeButton = document.querySelector('#analyze-button');
+    let selectedFile = null;
+    let previewUrl = null;
+
+    function showError(message) {
+      const el = document.querySelector('#error-message');
+      el.textContent = message;
+      el.classList.remove('hidden');
+    }
+    function clearError() { document.querySelector('#error-message').classList.add('hidden'); }
+    function setFile(file) {
+      clearError();
+      if (!file) return;
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) return showError('Choose a JPEG, PNG, or WebP image.');
+      if (file.size > 15 * 1024 * 1024) return showError('The image must be 15 MB or smaller.');
+      selectedFile = file;
+      document.querySelector('#file-name').textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+      document.querySelector('#file-name').classList.remove('hidden');
+      document.querySelector('#preview-empty').classList.add('hidden');
+      document.querySelector('#preview-wrap').classList.remove('hidden');
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(file);
+      document.querySelector('#preview').src = previewUrl;
+      analyzeButton.disabled = false;
+      document.querySelector('#age-result').innerHTML = '— <span class="text-sm font-medium text-muted">years</span>';
+      document.querySelector('#cva-result').textContent = 'Awaiting analysis';
+      document.querySelector('#result-note').classList.add('hidden');
+      document.querySelector('#result-status').textContent = 'Image ready for analysis.';
+    }
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); fileInput.click(); } });
+    fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+    for (const eventName of ['dragenter', 'dragover']) dropZone.addEventListener(eventName, event => { event.preventDefault(); dropZone.classList.add('drop-active'); });
+    for (const eventName of ['dragleave', 'drop']) dropZone.addEventListener(eventName, event => { event.preventDefault(); dropZone.classList.remove('drop-active'); });
+    dropZone.addEventListener('drop', event => setFile(event.dataTransfer.files[0]));
+
+    analyzeButton.addEventListener('click', async () => {
+      if (!selectedFile) return;
+      clearError();
+      analyzeButton.disabled = true;
+      document.querySelector('#button-spinner').classList.remove('hidden');
+      document.querySelector('#button-label').textContent = 'Analyzing…';
+      document.querySelector('#result-status').textContent = 'Sending image to the analysis API…';
+      try {
+        const formData = new FormData();
+        formData.append('file', selectedFile);
+        const response = await fetch(`${API_BASE}/predict`, { method: 'POST', body: formData });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || 'The analysis request failed.');
+        document.querySelector('#age-result').innerHTML = payload.predicted_skeletal_age_years == null
+          ? '— <span class="text-sm font-medium text-muted">years</span>'
+          : `${Number(payload.predicted_skeletal_age_years).toFixed(1)} <span class="text-sm font-medium text-muted">years</span>`;
+        document.querySelector('#cva-result').textContent = payload.cvm_stage_label || 'No result returned';
+        document.querySelector('#result-note').textContent = payload.message || '';
+        document.querySelector('#result-note').classList.toggle('hidden', !payload.message);
+        document.querySelector('#result-status').textContent = payload.status === 'complete' ? 'Analysis complete.' : 'API responded; model predictions are not configured yet.';
+      } catch (error) {
+        showError(error.message || 'Could not reach the API. Check that FastAPI is running.');
+        document.querySelector('#result-status').textContent = 'Analysis could not be completed.';
+      } finally {
+        analyzeButton.disabled = !selectedFile;
+        document.querySelector('#button-spinner').classList.add('hidden');
+        document.querySelector('#button-label').textContent = 'Analyze X-ray';
+      }
+    });
+
+    fetch(`${API_BASE}/health`).then(response => response.ok ? response.json() : Promise.reject())
+      .then(() => { document.querySelector('#api-dot').className = 'h-2 w-2 rounded-full bg-emerald-500'; document.querySelector('#api-status').textContent = 'API connected'; })
+      .catch(() => { document.querySelector('#api-dot').className = 'h-2 w-2 rounded-full bg-amber-400'; document.querySelector('#api-status').textContent = 'API offline'; });
+  </script>
+</body>
+</html>

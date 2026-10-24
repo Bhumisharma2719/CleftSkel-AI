@@ -1,0 +1,24 @@
+{
+  "stage_values": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "stage_titles": {
+    "5": "CVM-S5",
+    "4": "CVM-S4",
+    "1": "CVM-S1",
+    "3": "CVM-S3",
+    "2": "CVM-S2",
+    "6": "CVM-S6"
+  },
+  "image_size": [
+    224,
+    224
+  ],
+  "has_skeletal_age_head": false,
+  "dataset_dir": "C:\\Users\\Bhumi\\Desktop\\Aariz"
+}

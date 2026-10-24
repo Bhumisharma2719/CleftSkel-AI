@@ -1,6 +1,6 @@
 # CLEFTSKEL-AI
 
-Starter project for a FastAPI image-analysis API and a standalone HTML dashboard. The API currently validates uploads and returns a clearly marked placeholder response; it does not make clinical predictions until a trained model is integrated.
+FastAPI and HTML/Tailwind capstone application for research into lateral cephalogram CVM classification.
 
 ## Project structure
 
@@ -61,11 +61,22 @@ The trained model and stage metadata are written to `backend/artifacts/`. Start 
 python backend\model.py --train --age-labels path\to\age_labels.csv
 ```
 
-The training code only enables the age regression head when every training and validation image has an explicit age label. It does not convert a CVM stage into a made-up age. The optional CSV should be appropriately split by patient to avoid leakage; this starter preserves Aariz's existing split folders.
+The age head is trained from explicit age CSV values when all train and validation records have labels. For an experiment with discrete stage labels only, you can opt into a synthetic map JSON such as:
+
+```json
+{"1": 9.0, "2": 10.5, "3": 12.0, "4": 13.5, "5": 15.0, "6": 16.0}
+```
+
+Those numbers are user supplied placeholders, not validated clinical targets. Run `python backend\model.py --train --stage-age-map path\to\stage_age_map.json`. Reports and API metadata identify this output as a synthetic mapped proxy. Do not use it as a true age estimate or for care decisions. An age head trained with real, patient-linked age labels is needed to make age claims.
+
+## Downloadable PDF report
+
+After successful image analysis, use **Download PDF Report**. `POST /download-report` runs inference on the uploaded file and returns a one-page PDF with the X-ray, CVM stage, model confidence, age output/source, configurable hospital name, and UTC timestamp. Set the `CLEFTSKEL_HOSPITAL_NAME` environment variable before starting Uvicorn to change the report header. The report states that CVA anomaly detection is not part of the current model.
 
 ## API
 
 - `GET /health` — readiness check.
 - `POST /predict` — multipart form upload using the field name `file`; accepts JPEG, PNG, or WebP up to 15 MB. Returns HTTP 503 until a trained model and metadata are present.
+- `POST /download-report` — same multipart upload; returns a PDF attachment.
 
 This starter is not a medical device and has not been validated for clinical use. Handle patient images according to your institution's privacy and security requirements before deployment.

@@ -20,5 +20,7 @@
     224
   ],
   "has_skeletal_age_head": false,
+  "age_target_source": null,
+  "stage_age_map": null,
   "dataset_dir": "C:\\Users\\Bhumi\\Desktop\\Aariz"
 }

@@ -1,0 +1,36 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.virtualenv/
+
+# Trained model artifacts and checkpoints
+backend/artifacts/
+backend/artifacts/*.keras
+backend/artifacts/*.h5
+backend/artifacts/*.hdf5
+backend/artifacts/*.weights.h5
+backend/artifacts/*.ckpt
+backend/artifacts/checkpoint
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local secrets and editor settings
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/

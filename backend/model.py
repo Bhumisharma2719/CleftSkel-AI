@@ -1,8 +1,8 @@
 """Aariz dataset loader, MobileNetV2 training, and inference for CLEFTSKEL-AI.
 
 The Aariz CVM annotation files contain CVM stages, not skeletal age in years.
-An age regression head is therefore trained only when every training record has
-an explicit `skeletal_age_years` annotation (or a supplied age-label CSV).
+Age regression can use direct age labels, or explicitly opted-in mapped stage
+targets. Mapped targets are synthetic proxies and are marked as such in output.
 """
 
 from __future__ import annotations
@@ -132,6 +132,7 @@ def train_model(
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
     output_path: str | Path = MODEL_PATH,
     age_labels_csv: str | Path | None = None,
+    stage_age_map: dict[int, float] | None = None,
     epochs: int = 15,
     batch_size: int = 16,
     image_size: tuple[int, int] = IMAGE_SIZE,
@@ -143,11 +144,21 @@ def train_model(
     if len(stage_values) < 2:
         raise ValueError("At least two CVM stages are required to train a classifier.")
     age_training_records = splits["train"] + splits.get("valid", [])
-    has_age = bool(age_training_records) and all(r["skeletal_age_years"] is not None for r in age_training_records)
+    has_direct_age = bool(age_training_records) and all(r["skeletal_age_years"] is not None for r in age_training_records)
+    mapped_age_map = {int(key): float(value) for key, value in (stage_age_map or {}).items()}
+    has_mapped_age = bool(mapped_age_map) and all(r["cvm_stage"] in mapped_age_map for r in age_training_records)
+    has_age = has_direct_age or has_mapped_age
+    age_target_source = "observed_labels" if has_direct_age else ("synthetic_stage_mapping" if has_mapped_age else None)
     if has_age:
-        age_values = [float(r["skeletal_age_years"]) for r in splits["train"]]
-        if any(not np.isfinite(v) or v <= 0 for v in age_values):
-            raise ValueError("Skeletal age labels must be finite positive numbers.")
+        age_values = [
+            float(r["skeletal_age_years"]) if has_direct_age else mapped_age_map[r["cvm_stage"]]
+            for r in age_training_records
+        ]
+        if any(not np.isfinite(value) or value <= 0 for value in age_values):
+            raise ValueError("Skeletal age targets must be finite positive numbers.")
+    elif stage_age_map:
+        missing_stages = sorted({r["cvm_stage"] for r in age_training_records} - mapped_age_map.keys())
+        raise ValueError(f"Stage-to-age mapping is missing CVM stages: {missing_stages}")
     stage_to_index = {value: index for index, value in enumerate(stage_values)}
 
     def make_dataset(records, shuffle: bool):
@@ -164,7 +175,8 @@ def train_model(
                     raise ValueError(f"Could not read image {record['image_path']}: {exc}") from exc
                 label = {"cvm_stage": np.int32(stage_to_index[record["cvm_stage"]])}
                 if has_age:
-                    label["skeletal_age_years"] = np.float32(record["skeletal_age_years"])
+                    target = record["skeletal_age_years"] if has_direct_age else mapped_age_map[record["cvm_stage"]]
+                    label["skeletal_age_years"] = np.float32(target)
                 yield pixels, label
 
         output_signature = (
@@ -190,11 +202,13 @@ def train_model(
         "stage_titles": {str(r["cvm_stage"]): r["cvm_stage_title"] for r in splits["train"]},
         "image_size": list(image_size),
         "has_skeletal_age_head": has_age,
+        "age_target_source": age_target_source,
+        "stage_age_map": {str(key): value for key, value in mapped_age_map.items()} if has_mapped_age else None,
         "dataset_dir": str(Path(dataset_dir).resolve()),
     }
     destination.with_suffix(".labels.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     clear_model_cache()
-    return {"model_path": str(destination), "train_images": len(splits["train"]), "valid_images": len(splits.get("valid", [])), "cvm_stages": stage_values, "skeletal_age_head_trained": has_age}
+    return {"model_path": str(destination), "train_images": len(splits["train"]), "valid_images": len(splits.get("valid", [])), "cvm_stages": stage_values, "skeletal_age_head_trained": has_age, "age_target_source": age_target_source}
 
 
 def clear_model_cache() -> None:
@@ -241,8 +255,13 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
         "cvm_stage_label": metadata.get("stage_titles", {}).get(str(stage_value), f"CVM-S{stage_value}"),
         "cva_status": "Not evaluated",
         "cvm_stage_confidence": round(float(probabilities[index]), 4),
+        "age_target_source": metadata.get("age_target_source"),
         "status": "complete" if predicted_age is not None else "age_labels_required",
-        "message": "" if predicted_age is not None else "CVM stage predicted. Aariz provides no age-in-years labels, so skeletal age estimation is not trained.",
+        "message": (
+            "Age head trained on synthetic ages mapped from CVM stages; this is not an observed or clinically validated age prediction."
+            if metadata.get("age_target_source") == "synthetic_stage_mapping"
+            else ("" if predicted_age is not None else "CVM stage predicted. Age-in-years labels or an explicit stage-age mapping are required to train the regression head.")
+        ),
     }
 
 
@@ -254,9 +273,11 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default=str(DEFAULT_DATASET_DIR), help="Aariz dataset root.")
     parser.add_argument("--output", default=str(MODEL_PATH), help="Output .keras model path.")
     parser.add_argument("--age-labels", help="Optional CSV with cephalogram_id,skeletal_age_years columns.")
+    parser.add_argument("--stage-age-map", help="Optional JSON mapping CVM stage numbers to synthetic age targets, e.g. {\"1\": 9.0}.")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=16)
     args = parser.parse_args()
     if not args.train:
         parser.error("Pass --train to begin model training.")
-    print(json.dumps(train_model(args.dataset, args.output, args.age_labels, args.epochs, args.batch_size), indent=2))
+    age_map = json.loads(Path(args.stage_age_map).read_text(encoding="utf-8")) if args.stage_age_map else None
+    print(json.dumps(train_model(args.dataset, args.output, args.age_labels, age_map, args.epochs, args.batch_size), indent=2))

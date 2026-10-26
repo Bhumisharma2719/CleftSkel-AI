@@ -63,7 +63,7 @@ def _make_report(image_bytes: bytes, result: dict, filename: str) -> bytes:
     """Create a one-page PDF using the server's own prediction result."""
     try:
         from reportlab.lib import colors
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT
+        from reportlab.lib.enums import TA_LEFT
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
@@ -107,6 +107,7 @@ def _make_report(image_bytes: bytes, result: dict, filename: str) -> bytes:
         ["CVM stage", stage],
         ["Stage confidence", f"{confidence:.1f}%"],
         ["Skeletal age", escape(age_text)],
+        ["ROI preprocessing", escape(result.get("roi_status", "not reported"))],
         ["CVA anomaly assessment", "Not evaluated by this model"],
     ], colWidths=[52 * mm, 108 * mm])
     result_table.setStyle(TableStyle([

@@ -67,7 +67,30 @@ The age head is trained from explicit age CSV values when all train and validati
 {"1": 9.0, "2": 10.5, "3": 12.0, "4": 13.5, "5": 15.0, "6": 16.0}
 ```
 
-Those numbers are user supplied placeholders, not validated clinical targets. Run `python backend\model.py --train --stage-age-map path\to\stage_age_map.json`. Reports and API metadata identify this output as a synthetic mapped proxy. Do not use it as a true age estimate or for care decisions. An age head trained with real, patient-linked age labels is needed to make age claims.
+Those numbers are user-supplied synthetic proxy targets, not validated clinical targets. The included project-root `stage_age_map.json` uses these example values. Train both the CVM classifier and regression head from the project root with:
+
+```powershell
+python backend\model.py --train --stage-age-map .\stage_age_map.json
+```
+
+The training script maps each annotation's numeric CVM stage to the configured age target. Reports and API metadata identify this output as a synthetic mapped proxy. Do not use it as a true age estimate or for care decisions. An age head trained with real, patient-linked age labels is needed to make age claims.
+
+### Train the cervical ROI localizer
+
+Aariz's supplied landmark files do not mark C2-C4 bounding boxes, so ROI localization is trained only if you provide box labels. Create a CSV with one normalized box per cephalogram (`x_min`, `y_min`, `x_max`, `y_max` each from 0 to 1, relative to the original image):
+
+```csv
+cephalogram_id,x_min,y_min,x_max,y_max
+sample_image_id,0.30,0.55,0.58,0.88
+```
+
+Pass it during training:
+
+```powershell
+python backend\model.py --train --roi-boxes path\to\c2_c3_c4_boxes.csv --epochs 15 --batch-size 16
+```
+
+When every training and validation image has a box, training fits a MobileNetV2 ROI localizer and crops those boxes for CVM/age-head training. At inference, the localizer predicts a box and the classifier uses that crop. Without a complete ROI CSV, training and inference use the full image; the API and PDF identify that fallback. Review ROI boxes and localization quality before any research conclusions.
 
 ## Downloadable PDF report
 

@@ -144,7 +144,8 @@
         document.querySelector('#confidence-result').textContent = payload.cvm_stage_confidence == null ? '—' : `${(Number(payload.cvm_stage_confidence) * 100).toFixed(1)}%`;
         document.querySelector('#result-note').textContent = payload.message || '';
         document.querySelector('#result-note').classList.toggle('hidden', !payload.message);
-        document.querySelector('#result-status').textContent = payload.status === 'complete' ? 'Analysis complete.' : 'CVM analysis complete; age head is unavailable or uses synthetic targets.';
+        const roiText = payload.roi_status === 'automatic_c2_c3_c4_roi' ? 'C2–C4 ROI localized.' : 'Full image used; C2–C4 ROI localizer unavailable.';
+        document.querySelector('#result-status').textContent = `${payload.status === 'complete' ? 'Analysis complete.' : 'CVM analysis complete; age head is unavailable or uses synthetic targets.'} ${roiText}`;
         analysisComplete = true;
         reportButton.disabled = false;
         reportButton.classList.remove('hidden');

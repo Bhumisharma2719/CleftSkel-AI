@@ -19,8 +19,17 @@
     224,
     224
   ],
-  "has_skeletal_age_head": false,
-  "age_target_source": null,
-  "stage_age_map": null,
+  "has_skeletal_age_head": true,
+  "age_target_source": "synthetic_stage_mapping",
+  "stage_age_map": {
+    "1": 9.0,
+    "2": 10.5,
+    "3": 12.0,
+    "4": 13.5,
+    "5": 15.0,
+    "6": 16.0
+  },
+  "roi_model_path": null,
+  "roi_training_source": null,
   "dataset_dir": "C:\\Users\\Bhumi\\Desktop\\Aariz"
 }

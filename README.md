@@ -96,6 +96,21 @@ When every training and validation image has a box, training fits a MobileNetV2 
 
 After successful image analysis, use **Download PDF Report**. `POST /download-report` runs inference on the uploaded file and returns a one-page PDF with the X-ray, CVM stage, model confidence, age output/source, configurable hospital name, and UTC timestamp. Set the `CLEFTSKEL_HOSPITAL_NAME` environment variable before starting Uvicorn to change the report header. The report states that CVA anomaly detection is not part of the current model.
 
+## Growth timing research guidance
+
+`POST /predict` also returns `clinical_guidance`, a transparent rule-based summary: CS1–2 are grouped as prepubertal, CS3–4 as circumpubertal, and CS5–6 as postpubertal. The CS3–CS4 peak association is based on longitudinal research, but CVM evidence has limitations; the output deliberately does not estimate an individual countdown to completed maturity or make an autonomous treat/defer/surgery decision. A stage-mapped synthetic age is excluded from these rules. Confidence below `CLEFTSKEL_GUIDANCE_MIN_CONFIDENCE` (default `0.65`) returns an uncertain phase and neutral guidance. This is a research prototype, not a validated clinical device.
+
+## Check the API and report
+
+Train a model first (the example age map produces synthetic proxy targets), then run Uvicorn as described above. In PowerShell, use `curl.exe` with a local image path:
+
+```powershell
+curl.exe -X POST -F "file=@C:/path/to/cephalogram.png;type=image/png" http://127.0.0.1:8000/predict
+curl.exe -X POST -F "file=@C:/path/to/cephalogram.png;type=image/png" -o .\growth-assessment.pdf http://127.0.0.1:8000/download-report
+```
+
+In the JSON response, inspect `clinical_guidance.growth_phase_label`, `estimated_time_to_skeletal_maturity`, `treatment_timing_guidance`, and `treat_now_or_defer`. The PDF should contain Patient/Image Metadata, AI Diagnostic Findings, Growth Phase Assessment, Treatment Timing Guidance, evidence notes, and the research/clinician-validation disclaimer. The timeline is intentionally qualitative: a single CVM stage cannot establish a patient-specific maturity date.
+
 ## API
 
 - `GET /health` — readiness check.

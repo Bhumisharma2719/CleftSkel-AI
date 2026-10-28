@@ -370,6 +370,19 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
     probabilities = np.asarray(outputs["cvm_stage"])[0]
     index = int(np.argmax(probabilities))
     stage_value = int(metadata["stage_values"][index])
+    top_indices = np.argsort(probabilities)[::-1][:min(2, len(probabilities))]
+    top2 = [
+        {
+            "stage": int(metadata["stage_values"][candidate_index]),
+            "label": metadata.get("stage_titles", {}).get(
+                str(metadata["stage_values"][candidate_index]),
+                f"CVM-S{metadata['stage_values'][candidate_index]}",
+            ),
+            "softmax_score": round(float(probabilities[candidate_index]), 6),
+            "softmax_score_percent": round(float(probabilities[candidate_index]) * 100, 2),
+        }
+        for candidate_index in top_indices
+    ]
     age_output = outputs.get("skeletal_age_years")
     predicted_age = float(np.asarray(age_output).reshape(-1)[0]) if age_output is not None else None
     return {
@@ -378,6 +391,8 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
         "cvm_stage_label": metadata.get("stage_titles", {}).get(str(stage_value), f"CVM-S{stage_value}"),
         "cva_status": "Not evaluated",
         "cvm_stage_confidence": round(float(probabilities[index]), 4),
+        "cvm_stage_top2": top2,
+        "confidence_calibration": "uncalibrated_softmax_scores",
         "roi_status": roi_status,
         "age_target_source": metadata.get("age_target_source"),
         "status": "complete" if predicted_age is not None else "age_labels_required",

@@ -8,9 +8,13 @@ targets. Mapped targets are synthetic proxies and are marked as such in output.
 from __future__ import annotations
 
 import csv
+import copy
+import hashlib
 import io
 import json
 import os
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +29,12 @@ IMAGE_SIZE = (224, 224)
 _loaded_model = None
 _loaded_metadata: dict[str, Any] | None = None
 _loaded_roi_model = None
-_loaded_roi_model = None
+_load_lock = threading.Lock()
+_inference_lock = threading.Lock()
+_cache_lock = threading.Lock()
+_prediction_cache: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
+_model_generation = 0
+_PREDICTION_CACHE_LIMIT = int(os.getenv("CLEFTSKEL_PREDICTION_CACHE_SIZE", "64"))
 
 
 def _read_age_labels(age_labels_csv: str | Path | None) -> dict[str, float]:
@@ -303,23 +312,31 @@ def train_model(
 
 
 def clear_model_cache() -> None:
-    global _loaded_model, _loaded_metadata, _loaded_roi_model
+    global _loaded_model, _loaded_metadata, _loaded_roi_model, _model_generation
     _loaded_model = None
     _loaded_metadata = None
     _loaded_roi_model = None
+    with _cache_lock:
+        _model_generation += 1
+        _prediction_cache.clear()
 
 
 def _get_model():
     global _loaded_model, _loaded_metadata
     if _loaded_model is not None:
         return _loaded_model, _loaded_metadata
-    if not MODEL_PATH.is_file():
-        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Train it with `python backend/model.py --train`.")
-    tf = _tensorflow()
-    _loaded_model = tf.keras.models.load_model(MODEL_PATH)
-    if not LABELS_PATH.is_file():
-        raise FileNotFoundError(f"Model metadata not found at {LABELS_PATH}.")
-    _loaded_metadata = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+    with _load_lock:
+        if _loaded_model is not None:
+            return _loaded_model, _loaded_metadata
+        if not MODEL_PATH.is_file():
+            raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Train it with `python backend/model.py --train`.")
+        tf = _tensorflow()
+        loaded_model = tf.keras.models.load_model(MODEL_PATH)
+        if not LABELS_PATH.is_file():
+            raise FileNotFoundError(f"Model metadata not found at {LABELS_PATH}.")
+        loaded_metadata = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+        _loaded_model = loaded_model
+        _loaded_metadata = loaded_metadata
     return _loaded_model, _loaded_metadata
 
 
@@ -334,12 +351,52 @@ def _get_roi_model(metadata: dict[str, Any]):
     if not roi_path.is_file():
         return None
     if _loaded_roi_model is None:
-        _loaded_roi_model = _tensorflow().keras.models.load_model(roi_path)
+        with _load_lock:
+            if _loaded_roi_model is None:
+                _loaded_roi_model = _tensorflow().keras.models.load_model(roi_path)
     return _loaded_roi_model
+
+
+def _cached_prediction(image_hash: str) -> dict[str, Any] | None:
+    with _cache_lock:
+        value = _prediction_cache.get((_model_generation, image_hash))
+        if value is None:
+            return None
+        _prediction_cache.move_to_end((_model_generation, image_hash))
+        return copy.deepcopy(value)
+
+
+def _store_prediction(image_hash: str, result: dict[str, Any]) -> None:
+    with _cache_lock:
+        key = (_model_generation, image_hash)
+        _prediction_cache[key] = copy.deepcopy(result)
+        _prediction_cache.move_to_end(key)
+        while len(_prediction_cache) > max(0, _PREDICTION_CACHE_LIMIT):
+            _prediction_cache.popitem(last=False)
+
+
+def warmup_model() -> bool:
+    """Load model artifacts and execute a dummy call at application startup."""
+    if not MODEL_PATH.is_file() or not LABELS_PATH.is_file():
+        return False
+    model, metadata = _get_model()
+    image_size = metadata["image_size"]
+    dummy = np.zeros((1, image_size[0], image_size[1], 3), dtype=np.float32)
+    with _inference_lock:
+        model(dummy, training=False)
+        roi_model = _get_roi_model(metadata)
+        if roi_model is not None:
+            roi_model(dummy, training=False)
+    return True
 
 
 def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
     """Run an uploaded image through the trained model and map outputs."""
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+    cached = _cached_prediction(image_hash)
+    if cached is not None:
+        return cached
+
     model, metadata = _get_model()
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
@@ -349,24 +406,34 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
 
     roi_model = _get_roi_model(metadata)
     roi_status = "full_image_fallback_no_roi_model"
-    if roi_model is not None:
-        localizer_input = image.resize((metadata["image_size"][1], metadata["image_size"][0]))
-        localizer_pixels = np.asarray(localizer_input, dtype=np.float32)[None, ...]
-        box = np.asarray(roi_model.predict(localizer_pixels, verbose=0)).reshape(-1)
-        if box.size == 4:
-            x0, x1 = sorted((float(box[0]), float(box[2])))
-            y0, y1 = sorted((float(box[1]), float(box[3])))
-            if x1 - x0 >= 0.03 and y1 - y0 >= 0.03:
-                image = _crop_normalized(image, (x0, y0, x1, y1))
-                roi_status = "automatic_c2_c3_c4_roi"
-            else:
-                roi_status = "full_image_fallback_invalid_roi"
+    width, height = metadata["image_size"][1], metadata["image_size"][0]
+    with _inference_lock:
+        # Another worker may have completed this image while this one decoded it.
+        cached = _cached_prediction(image_hash)
+        if cached is not None:
+            return cached
+        if roi_model is not None:
+            localizer_pixels = np.ascontiguousarray(
+                image.resize((width, height), Image.Resampling.BILINEAR), dtype=np.float32
+            )[None, ...]
+            box_tensor = roi_model(localizer_pixels, training=False)
+            box = np.asarray(box_tensor.numpy() if hasattr(box_tensor, "numpy") else box_tensor).reshape(-1)
+            if box.size == 4:
+                x0, x1 = sorted((float(box[0]), float(box[2])))
+                y0, y1 = sorted((float(box[1]), float(box[3])))
+                if x1 - x0 >= 0.03 and y1 - y0 >= 0.03:
+                    image = _crop_normalized(image, (x0, y0, x1, y1))
+                    roi_status = "automatic_c2_c3_c4_roi"
+                else:
+                    roi_status = "full_image_fallback_invalid_roi"
 
-    classifier_image = image.resize((metadata["image_size"][1], metadata["image_size"][0]))
-    pixels = np.asarray(classifier_image, dtype=np.float32)[None, ...]
-
-    raw = model.predict(pixels, verbose=0)
-    outputs = raw if isinstance(raw, dict) else {model.output_names[0]: raw}
+        classifier_image = image.resize((width, height), Image.Resampling.BILINEAR)
+        pixels = np.ascontiguousarray(classifier_image, dtype=np.float32)[None, ...]
+        raw = model(pixels, training=False)
+        outputs = {
+            name: np.asarray(value.numpy() if hasattr(value, "numpy") else value)
+            for name, value in raw.items()
+        } if isinstance(raw, dict) else {model.output_names[0]: np.asarray(raw.numpy() if hasattr(raw, "numpy") else raw)}
     probabilities = np.asarray(outputs["cvm_stage"])[0]
     index = int(np.argmax(probabilities))
     stage_value = int(metadata["stage_values"][index])
@@ -385,7 +452,7 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
     ]
     age_output = outputs.get("skeletal_age_years")
     predicted_age = float(np.asarray(age_output).reshape(-1)[0]) if age_output is not None else None
-    return {
+    result = {
         "predicted_skeletal_age_years": round(predicted_age, 1) if predicted_age is not None else None,
         "cvm_stage": stage_value,
         "cvm_stage_label": metadata.get("stage_titles", {}).get(str(stage_value), f"CVM-S{stage_value}"),
@@ -402,6 +469,8 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
             else ("" if predicted_age is not None else "CVM stage predicted. Age-in-years labels or an explicit stage-age mapping are required to train the regression head.")
         ),
     }
+    _store_prediction(image_hash, result)
+    return result
 
 
 if __name__ == "__main__":

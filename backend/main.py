@@ -7,19 +7,38 @@ patient-specific treatment recommendation or a substitute for clinician review.
 from datetime import datetime, timezone
 from html import escape
 from io import BytesIO
+import logging
 import os
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from PIL import Image as PILImage, UnidentifiedImageError
+from starlette.concurrency import run_in_threadpool
 
-from model import predict_from_image
+from model import predict_from_image, warmup_model
+
+logger = logging.getLogger("cleftskel")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Pay model loading / first-kernel setup during server startup when artifacts exist.
+    try:
+        warmed = await run_in_threadpool(warmup_model)
+        if warmed:
+            logger.info("CLEFTSKEL-AI model loaded and warmed up.")
+    except Exception:
+        # Keep health/docs available if the model artifact or accelerator is not ready.
+        logger.exception("CLEFTSKEL-AI model warm-up failed; inference will retry on demand.")
+    yield
 
 app = FastAPI(
     title="CLEFTSKEL-AI API",
     description="Research prototype for lateral cephalogram CVM classification.",
     version="0.4.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -55,9 +74,9 @@ async def _read_image(file: UploadFile) -> bytes:
     return image_bytes
 
 
-def _predict_or_http_error(image_bytes: bytes) -> dict:
+async def _predict_or_http_error(image_bytes: bytes) -> dict:
     try:
-        result = predict_from_image(image_bytes)
+        result = await run_in_threadpool(predict_from_image, image_bytes)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -362,16 +381,16 @@ def _make_report(image_bytes: bytes, result: dict, filename: str) -> bytes:
 async def predict(file: UploadFile = File(...)):
     """Return model findings plus transparent stage-based growth guidance."""
     image_bytes = await _read_image(file)
-    return _predict_or_http_error(image_bytes)
+    return await _predict_or_http_error(image_bytes)
 
 
 @app.post("/download-report")
 async def download_report(file: UploadFile = File(...)):
     """Re-run inference and return the enhanced clinical research dossier PDF."""
     image_bytes = await _read_image(file)
-    result = _predict_or_http_error(image_bytes)
+    result = await _predict_or_http_error(image_bytes)
     try:
-        pdf_bytes = _make_report(image_bytes, result, file.filename or "uploaded image")
+        pdf_bytes = await run_in_threadpool(_make_report, image_bytes, result, file.filename or "uploaded image")
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:

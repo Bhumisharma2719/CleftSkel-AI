@@ -98,7 +98,9 @@ After successful image analysis, use **Download PDF Report**. `POST /download-re
 
 ## Growth timing research guidance
 
-`POST /predict` also returns `clinical_guidance`, a transparent rule-based summary: CS1–2 are grouped as prepubertal, CS3–4 as circumpubertal, and CS5–6 as postpubertal. The CS3–CS4 peak association is based on longitudinal research, but CVM evidence has limitations; the output deliberately does not estimate an individual countdown to completed maturity or make an autonomous treat/defer/surgery decision. A stage-mapped synthetic age is excluded from these rules. Confidence below `CLEFTSKEL_GUIDANCE_MIN_CONFIDENCE` (default `0.65`) returns an uncertain phase and neutral guidance. This is a research prototype, not a validated clinical device.
+`POST /predict` also returns `clinical_guidance`, a transparent rule-based summary: CS1–2 are grouped as prepubertal, CS3–4 as circumpubertal, and CS5–6 as postpubertal. The CS3–CS4 peak association is based on longitudinal research, but CVM evidence has limitations; the output deliberately does not estimate an individual countdown to completed maturity or make an autonomous treat/defer/surgery decision. A stage-mapped synthetic age is excluded from these rules. This is a research prototype, not a validated clinical device.
+
+Stage scores in the response are raw, uncalibrated softmax values. The default routing thresholds are `CLEFTSKEL_GUIDANCE_SECONDARY_REVIEW=0.40` and `CLEFTSKEL_GUIDANCE_HIGH_CONFIDENCE=0.65`; scores in between prompt secondary review, and lower scores prompt manual review. These thresholds are workflow bands, not probability calibration. Calibrated probabilities require held-out, representative validation data and a calibration procedure.
 
 ## Check the API and report
 

@@ -12,6 +12,7 @@
   <style>
     body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     .drop-active { border-color: #137c8b; background: #effafb; }
+    @media print { header, footer, #upload-card, #recent-history, #result-actions, #clinical-review-flag { display: none !important; } body { background: white !important; } #comprehensive-report { display: block !important; margin-top: 0 !important; } .shadow-card { box-shadow: none !important; } }
   </style>
 </head>
 <body class="min-h-screen bg-canvas text-ink">
@@ -35,10 +36,16 @@
     </div>
 
     <div class="grid gap-6 lg:grid-cols-[1.05fr_.95fr]">
-      <section class="rounded-2xl border border-slate-200 bg-white p-5 shadow-card sm:p-7">
+      <section id="upload-card" class="rounded-2xl border border-slate-200 bg-white p-5 shadow-card sm:p-7">
         <div class="mb-5 flex items-start justify-between gap-3">
           <div><h2 class="font-semibold">Upload X-ray</h2><p class="mt-1 text-sm text-muted">JPEG, PNG, or WebP · up to 15 MB</p></div>
           <span class="rounded-full bg-teal/10 px-3 py-1 text-xs font-semibold text-teal">Lateral cephalogram</span>
+        </div>
+        <div class="mb-5 grid gap-3 sm:grid-cols-2">
+          <label class="text-xs font-semibold text-muted">Patient name (optional)<input id="patient-name" maxlength="120" autocomplete="off" class="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10" placeholder="Name" /></label>
+          <label class="text-xs font-semibold text-muted">Patient ID (optional)<input id="patient-id" maxlength="120" autocomplete="off" class="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10" placeholder="Clinic identifier" /></label>
+          <label class="text-xs font-semibold text-muted">Age or DOB (optional)<input id="patient-age" maxlength="40" autocomplete="off" class="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10" placeholder="e.g. 14 years or YYYY-MM" /></label>
+          <label class="text-xs font-semibold text-muted">Treating orthodontist (optional)<input id="orthodontist" maxlength="120" autocomplete="off" class="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10" placeholder="Clinician name" /></label>
         </div>
         <input id="file-input" type="file" accept="image/jpeg,image/png,image/webp" class="sr-only" />
         <button id="drop-zone" type="button" class="group flex min-h-64 w-full flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50/70 px-5 text-center transition hover:border-teal/60 hover:bg-teal/[.03] focus:outline-none focus:ring-4 focus:ring-teal/10" aria-label="Choose an X-ray image or drop one here">
@@ -85,13 +92,19 @@
             <h2 id="report-heading" class="mt-1 text-2xl font-bold tracking-tight">Comprehensive Analysis Report</h2>
             <p class="mt-2 text-sm text-muted">Growth-phase context and treatment-timing prompts for clinician review.</p>
           </div>
+          <div id="result-actions" class="flex flex-wrap gap-2">
+          <button id="print-button" type="button" disabled onclick="window.print()" class="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-ink shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400">
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 8V3h10v5M7 17H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2M7 14h10v7H7z"/></svg>Print Report
+          </button>
           <button id="report-button" type="button" disabled class="inline-flex items-center justify-center gap-2 rounded-xl bg-teal px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-[#0d6875] focus:outline-none focus:ring-4 focus:ring-teal/15 disabled:cursor-not-allowed disabled:bg-slate-300">
             <span id="report-spinner" class="hidden h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent"></span>
             <svg id="report-icon" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 17v3h14v-3"/></svg>
             <span id="report-label">Download PDF Report</span>
           </button>
+          </div>
         </div>
 
+        <div id="patient-summary" class="mb-5 hidden rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm"></div>
         <div id="clinical-review-flag" class="mb-5 hidden rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-950" role="status"></div>
 
         <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
@@ -128,6 +141,12 @@
             <p id="clinical-notes" class="mt-3 text-sm leading-6 text-amber-950"></p>
           </article>
         </div>
+
+    <details id="recent-history" class="mt-6 rounded-2xl border border-slate-200 bg-white shadow-card">
+      <summary class="cursor-pointer list-none px-5 py-4 font-semibold"><span class="mr-2 text-teal">▸</span>Recent analyses <span class="ml-2 text-xs font-normal text-muted">Saved locally on this browser · last 5 · no X-ray images stored</span></summary>
+      <div id="history-list" class="grid gap-3 border-t border-slate-100 p-5 sm:grid-cols-2 lg:grid-cols-3"><p class="text-sm text-muted">No saved analyses yet.</p></div>
+      <div class="border-t border-slate-100 px-5 py-3 text-right"><button id="clear-history" type="button" class="text-xs font-semibold text-rose-700 hover:underline">Clear local history</button></div>
+    </details>
         <div class="mt-5 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3.5 text-sm leading-6 text-amber-950">
           <svg class="mt-0.5 h-5 w-5 shrink-0 text-amber-700" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.72-1.36 3.486 0l6.518 11.59C19.01 16.05 18.04 17.75 16.518 17.75H3.482c-1.522 0-2.492-1.7-1.743-3.061L8.257 3.1zM11 14a1 1 0 10-2 0 1 1 0 002 0zm-1-2a1 1 0 01-1-1V8a1 1 0 112 0v3a1 1 0 01-1 1z" clip-rule="evenodd"/></svg>
           <p><strong>Research decision support only.</strong> This is not an automated treatment order. Validate findings with the treating orthodontist or surgeon using the full clinical record.</p>
@@ -144,10 +163,67 @@
     const dropZone = document.querySelector('#drop-zone');
     const analyzeButton = document.querySelector('#analyze-button');
     const reportButton = document.querySelector('#report-button');
+    const printButton = document.querySelector('#print-button');
     const comprehensiveReport = document.querySelector('#comprehensive-report');
     let selectedFile = null;
     let previewUrl = null;
     let analysisComplete = false;
+    const HISTORY_KEY = 'cleftskel_recent_analyses_v1';
+
+    function currentMetadata() {
+      return { patient_name: document.querySelector('#patient-name').value.trim(), patient_id: document.querySelector('#patient-id').value.trim(), patient_age: document.querySelector('#patient-age').value.trim(), treating_orthodontist: document.querySelector('#orthodontist').value.trim() };
+    }
+    function appendMetadata(formData) { Object.entries(currentMetadata()).forEach(([key, value]) => { if (value) formData.append(key, value); }); }
+    function metadataMarkup(meta = {}) {
+      const fields = [['Patient', meta.patient_name], ['ID', meta.patient_id], ['Age / DOB', meta.patient_age], ['Orthodontist', meta.treating_orthodontist]].filter(([, value]) => value);
+      return fields.length ? fields.map(([label, value]) => `<span><strong>${label}:</strong> ${escapeHtml(value)}</span>`).join('<span class="text-slate-300">|</span>') : '<span class="text-muted">No patient metadata supplied</span>';
+    }
+    function escapeHtml(value) { return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]); }
+    function readHistory() { try { const data = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); return Array.isArray(data) ? data.slice(0, 5) : []; } catch { return []; } }
+    function renderHistory() {
+      const history = readHistory();
+      const list = document.querySelector('#history-list');
+      list.replaceChildren();
+      if (!history.length) { list.innerHTML = '<p class="text-sm text-muted">No saved analyses yet.</p>'; return; }
+      history.forEach((record, index) => {
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'rounded-xl border border-slate-200 p-4 text-left transition hover:border-teal/50 hover:bg-teal/[.03]';
+        const title = `Analysis ${history.length - index}`;
+        button.innerHTML = `<span class="block truncate text-sm font-semibold">${escapeHtml(title)}</span><span class="mt-1 block text-xs text-muted">${escapeHtml(new Date(record.saved_at).toLocaleString())}</span><span class="mt-2 block text-sm text-ink">${escapeHtml(record.cvm_stage_label || 'Stage unavailable')} · ${record.predicted_skeletal_age_years == null ? 'Age unavailable' : `${Number(record.predicted_skeletal_age_years).toFixed(1)} years`}</span><span class="mt-1 block text-xs text-muted">Model score ${record.cvm_stage_confidence == null ? '—' : `${(Number(record.cvm_stage_confidence) * 100).toFixed(1)}%`}</span>`;
+        button.addEventListener('click', () => restoreHistory(record));
+        list.append(button);
+      });
+    }
+    function saveHistory(payload) {
+      try {
+        // Keep history comparable without persisting identifiers, filenames, or X-ray bytes.
+        const record = { saved_at: new Date().toISOString(), cvm_stage: payload.cvm_stage, cvm_stage_label: payload.cvm_stage_label, cvm_stage_confidence: payload.cvm_stage_confidence, cvm_stage_top2: payload.cvm_stage_top2, predicted_skeletal_age_years: payload.predicted_skeletal_age_years, age_target_source: payload.age_target_source, roi_status: payload.roi_status, clinical_guidance: payload.clinical_guidance };
+        localStorage.setItem(HISTORY_KEY, JSON.stringify([record, ...readHistory().filter(item => item.saved_at !== record.saved_at)].slice(0, 5)));
+        renderHistory();
+      } catch { showError('Analysis succeeded, but this browser could not save it to local history.'); }
+    }
+    function restoreHistory(record) {
+      const meta = {};
+      for (const [id, key] of [['patient-name','patient_name'],['patient-id','patient_id'],['patient-age','patient_age'],['orthodontist','treating_orthodontist']]) document.querySelector(`#${id}`).value = meta[key] || '';
+      document.querySelector('#patient-summary').textContent = 'Saved history omits patient identifiers and image data.'; document.querySelector('#patient-summary').classList.remove('hidden');
+      document.querySelector('#age-result').innerHTML = record.predicted_skeletal_age_years == null ? '— <span class="text-sm font-medium text-muted">years</span>' : `${Number(record.predicted_skeletal_age_years).toFixed(1)} <span class="text-sm font-medium text-muted">years</span>`;
+      document.querySelector('#cva-result').textContent = record.cvm_stage_label || 'Stage unavailable';
+      document.querySelector('#confidence-result').textContent = record.cvm_stage_confidence == null ? '—' : `${(Number(record.cvm_stage_confidence) * 100).toFixed(1)}%`;
+      const guidance = record.clinical_guidance || {};
+      document.querySelector('#growth-phase').textContent = guidance.growth_phase_label || 'Unavailable'; document.querySelector('#growth-summary').textContent = guidance.phase_summary || '';
+      document.querySelector('#growth-velocity').textContent = guidance.growth_velocity_descriptor || ''; document.querySelector('#maturity-timeline').textContent = guidance.estimated_time_to_skeletal_maturity || '';
+      document.querySelector('#active-growth-duration').textContent = guidance.active_growth_duration_note || ''; document.querySelector('#treatment-decision').textContent = guidance.treat_now_or_defer || '';
+      document.querySelector('#treatment-guidance').textContent = guidance.treatment_timing_guidance || ''; document.querySelector('#potential-benefits').textContent = guidance.potential_benefits || '';
+      document.querySelector('#clinical-notes').textContent = [guidance.risks_and_uncertainties, guidance.age_context].filter(Boolean).join(' ');
+      const top2 = record.cvm_stage_top2 || guidance.cvm_stage_top2 || [];
+      document.querySelector('#stage-candidates').textContent = top2.slice(0,2).map(item => `${item.label || `CS${item.stage}`} · ${Number(item.softmax_score_percent || 0).toFixed(1)}%`).join(' / ') || 'Candidate scores unavailable';
+      document.querySelector('#preview-wrap').classList.add('hidden'); document.querySelector('#preview-empty').classList.remove('hidden'); document.querySelector('#preview-empty').innerHTML = '<div>Preview is not saved in local history to protect patient image privacy.</div>';
+      analysisComplete = false; reportButton.disabled = true; printButton.disabled = false; comprehensiveReport.classList.remove('hidden');
+      document.querySelector('#result-status').textContent = 'Showing saved result summary. Select a new image to generate a current PDF or print report.';
+      requestAnimationFrame(() => comprehensiveReport.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+    }
+    document.querySelector('#clear-history').addEventListener('click', () => { localStorage.removeItem(HISTORY_KEY); renderHistory(); });
+    renderHistory();
 
     function showError(message) {
       const el = document.querySelector('#error-message');
@@ -163,6 +239,9 @@
       selectedFile = file;
       analysisComplete = false;
       reportButton.disabled = true;
+      printButton.disabled = true;
+      document.querySelector('#patient-summary').classList.add('hidden');
+      printButton.disabled = true;
       comprehensiveReport.classList.add('hidden');
       document.querySelector('#file-name').textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
       document.querySelector('#file-name').classList.remove('hidden');
@@ -196,9 +275,13 @@
       try {
         const formData = new FormData();
         formData.append('file', selectedFile);
+        appendMetadata(formData);
         const response = await fetch(`${API_BASE}/predict`, { method: 'POST', body: formData });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.detail || 'The analysis request failed.');
+        const patientMetadata = payload.patient_metadata || currentMetadata();
+        document.querySelector('#patient-summary').innerHTML = metadataMarkup(patientMetadata);
+        document.querySelector('#patient-summary').classList.remove('hidden');
         document.querySelector('#age-result').innerHTML = payload.predicted_skeletal_age_years == null
           ? '— <span class="text-sm font-medium text-muted">years</span>'
           : `${Number(payload.predicted_skeletal_age_years).toFixed(1)} <span class="text-sm font-medium text-muted">years</span>`;
@@ -231,6 +314,8 @@
         document.querySelector('#result-status').textContent = `${payload.status === 'complete' ? 'Analysis complete.' : 'CVM analysis complete; age head is unavailable or uses synthetic targets.'} ${roiText}`;
         analysisComplete = true;
         reportButton.disabled = false;
+        printButton.disabled = false;
+        saveHistory(payload);
         comprehensiveReport.classList.remove('hidden');
         requestAnimationFrame(() => comprehensiveReport.scrollIntoView({ behavior: 'smooth', block: 'start' }));
       } catch (error) {
@@ -253,6 +338,7 @@
       try {
         const formData = new FormData();
         formData.append('file', selectedFile);
+        appendMetadata(formData);
         const response = await fetch(`${API_BASE}/download-report`, { method: 'POST', body: formData });
         if (!response.ok) {
           const errorPayload = await response.json().catch(() => ({}));

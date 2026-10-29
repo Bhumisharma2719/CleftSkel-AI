@@ -11,7 +11,7 @@ import logging
 import os
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from PIL import Image as PILImage, UnidentifiedImageError
@@ -72,6 +72,26 @@ async def _read_image(file: UploadFile) -> bytes:
     if len(image_bytes) > MAX_FILE_BYTES:
         raise HTTPException(status_code=413, detail="Image exceeds the 15 MB limit.")
     return image_bytes
+
+
+def _clean_metadata(value: str | None, field_name: str, max_length: int = 120) -> str | None:
+    """Trim and bound optional metadata; values are used only for this response/report."""
+    if value is None:
+        return None
+    cleaned = " ".join(value.split())
+    if len(cleaned) > max_length:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be {max_length} characters or fewer.")
+    return cleaned or None
+
+
+def _patient_metadata(patient_name: str | None, patient_id: str | None,
+                      patient_age: str | None, treating_orthodontist: str | None) -> dict:
+    return {
+        "patient_name": _clean_metadata(patient_name, "Patient name"),
+        "patient_id": _clean_metadata(patient_id, "Patient ID"),
+        "patient_age": _clean_metadata(patient_age, "Patient age / DOB", 40),
+        "treating_orthodontist": _clean_metadata(treating_orthodontist, "Orthodontist name"),
+    }
 
 
 async def _predict_or_http_error(image_bytes: bytes) -> dict:
@@ -240,7 +260,7 @@ def build_growth_guidance(result: dict) -> dict:
     }
 
 
-def _make_report(image_bytes: bytes, result: dict, filename: str) -> bytes:
+def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict | None = None) -> bytes:
     """Create a hospital-style research dossier PDF with explicit limitations."""
     try:
         from reportlab.lib import colors
@@ -305,6 +325,7 @@ def _make_report(image_bytes: bytes, result: dict, filename: str) -> bytes:
         ]))
         return table
 
+    metadata = metadata or {}
     story = [
         para(HOSPITAL_NAME, "DossierSub"),
         para("Orthodontic Growth Assessment", "DossierTitle"),
@@ -312,7 +333,10 @@ def _make_report(image_bytes: bytes, result: dict, filename: str) -> bytes:
         Spacer(1, 4 * mm),
         para("Patient / Image Metadata", "DossierSection"),
         section_table([
-            ("Patient identifier", "Not supplied"),
+            ("Patient name", metadata.get("patient_name") or "Not supplied"),
+            ("Patient identifier", metadata.get("patient_id") or "Not supplied"),
+            ("Patient age / DOB", metadata.get("patient_age") or "Not supplied"),
+            ("Treating orthodontist", metadata.get("treating_orthodontist") or "Not supplied"),
             ("Image filename", filename or "Uploaded image"),
             ("Image dimensions", image_size),
             ("Image size", f"{len(image_bytes) / (1024 * 1024):.2f} MB"),
@@ -378,19 +402,32 @@ def _make_report(image_bytes: bytes, result: dict, filename: str) -> bytes:
 
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...), patient_name: str | None = Form(None),
+    patient_id: str | None = Form(None), patient_age: str | None = Form(None),
+    treating_orthodontist: str | None = Form(None),
+):
     """Return model findings plus transparent stage-based growth guidance."""
     image_bytes = await _read_image(file)
-    return await _predict_or_http_error(image_bytes)
+    metadata = _patient_metadata(patient_name, patient_id, patient_age, treating_orthodontist)
+    result = await _predict_or_http_error(image_bytes)
+    result["patient_metadata"] = metadata
+    return result
 
 
 @app.post("/download-report")
-async def download_report(file: UploadFile = File(...)):
+async def download_report(
+    file: UploadFile = File(...), patient_name: str | None = Form(None),
+    patient_id: str | None = Form(None), patient_age: str | None = Form(None),
+    treating_orthodontist: str | None = Form(None),
+):
     """Re-run inference and return the enhanced clinical research dossier PDF."""
     image_bytes = await _read_image(file)
+    metadata = _patient_metadata(patient_name, patient_id, patient_age, treating_orthodontist)
     result = await _predict_or_http_error(image_bytes)
     try:
-        pdf_bytes = await run_in_threadpool(_make_report, image_bytes, result, file.filename or "uploaded image")
+        result["patient_metadata"] = metadata
+        pdf_bytes = await run_in_threadpool(_make_report, image_bytes, result, file.filename or "uploaded image", metadata)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:

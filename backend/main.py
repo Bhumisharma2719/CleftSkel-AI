@@ -17,27 +17,38 @@ from fastapi.responses import StreamingResponse
 from PIL import Image as PILImage, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
 
-from model import predict_from_image, warmup_model
+from model import get_model_status, predict_cva_from_image, predict_from_image, warmup_model
 
 logger = logging.getLogger("cleftskel")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Pay model loading / first-kernel setup during server startup when artifacts exist.
+    status = await run_in_threadpool(get_model_status)
+    logger.info(
+        "CLEFTSKEL-AI startup artifact status: training_status=%s, CVM=%s, CVA=%s",
+        status.get("training_status"),
+        (status.get("cvm") or {}).get("state"),
+        (status.get("cva") or {}).get("state"),
+    )
+    for warning in status["warnings"]:
+        logger.warning(warning)
     try:
         warmed = await run_in_threadpool(warmup_model)
         if warmed:
             logger.info("CLEFTSKEL-AI model loaded and warmed up.")
+        else:
+            logger.error("CLEFTSKEL-AI CVM inference is unavailable; check model artifact status at /health.")
     except Exception:
         # Keep health/docs available if the model artifact or accelerator is not ready.
         logger.exception("CLEFTSKEL-AI model warm-up failed; inference will retry on demand.")
+    _app.state.model_status = await run_in_threadpool(get_model_status)
     yield
 
 app = FastAPI(
     title="CLEFTSKEL-AI API",
-    description="Research prototype for lateral cephalogram CVM classification.",
-    version="0.4.0",
+    description="Research prototype for lateral cephalogram CVMI classification and optional binary CVA screening.",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -52,6 +63,14 @@ app.add_middleware(
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_FILE_BYTES = 15 * 1024 * 1024
 HOSPITAL_NAME = os.getenv("CLEFTSKEL_HOSPITAL_NAME", "CLEFTSKEL-AI Research Center")
+STUDY_DOI = "10.1177/10556656241299890"
+# The values below were requested for the presentation but are not stated in the
+# accessible publisher abstract. Keep them explicitly provisional and contextual.
+PROJECT_COMPARISON_VALUES = {
+    "uclp_delayed_growth_percent": 51.25,
+    "non_uclp_delayed_growth_percent": 46.87,
+    "mean_skeletal_age_lag_years": 1.71,
+}
 GUIDANCE_HIGH_CONFIDENCE = float(os.getenv("CLEFTSKEL_GUIDANCE_HIGH_CONFIDENCE", "0.65"))
 GUIDANCE_SECONDARY_REVIEW_CONFIDENCE = float(os.getenv("CLEFTSKEL_GUIDANCE_SECONDARY_REVIEW", "0.40"))
 if not 0 <= GUIDANCE_SECONDARY_REVIEW_CONFIDENCE < GUIDANCE_HIGH_CONFIDENCE <= 1:
@@ -60,7 +79,8 @@ if not 0 <= GUIDANCE_SECONDARY_REVIEW_CONFIDENCE < GUIDANCE_HIGH_CONFIDENCE <= 1
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "CLEFTSKEL-AI API"}
+    model_status = await run_in_threadpool(get_model_status)
+    return {"status": "ok", "service": "CLEFTSKEL-AI API", "models": model_status}
 
 
 async def _read_image(file: UploadFile) -> bytes:
@@ -85,12 +105,48 @@ def _clean_metadata(value: str | None, field_name: str, max_length: int = 120) -
 
 
 def _patient_metadata(patient_name: str | None, patient_id: str | None,
-                      patient_age: str | None, treating_orthodontist: str | None) -> dict:
+                      patient_age: str | None, treating_orthodontist: str | None,
+                      patient_group: str = "non_uclp") -> dict:
+    group = (patient_group or "non_uclp").strip().lower()
+    if group not in {"uclp", "non_uclp"}:
+        raise HTTPException(status_code=422, detail="patient_group must be 'uclp' or 'non_uclp'.")
     return {
         "patient_name": _clean_metadata(patient_name, "Patient name"),
         "patient_id": _clean_metadata(patient_id, "Patient ID"),
         "patient_age": _clean_metadata(patient_age, "Patient age / DOB", 40),
         "treating_orthodontist": _clean_metadata(treating_orthodontist, "Orthodontist name"),
+        "patient_group": group,
+        "patient_group_label": "UCLP / Cleft" if group == "uclp" else "Non-Cleft",
+    }
+
+
+def build_group_comparison(patient_group: str) -> dict:
+    """Return group-level research context; never infer an individual patient's growth status from group membership."""
+    group = "uclp" if patient_group == "uclp" else "non_uclp"
+    rate = PROJECT_COMPARISON_VALUES[f"{group}_delayed_growth_percent"]
+    return {
+        "selected_group": group,
+        "selected_group_label": "UCLP / Cleft" if group == "uclp" else "Non-Cleft",
+        "project_supplied_delayed_growth_percent": rate,
+        "project_supplied_mean_skeletal_age_lag_years": PROJECT_COMPARISON_VALUES["mean_skeletal_age_lag_years"],
+        "project_supplied_group_difference_percentage_points": round(
+            PROJECT_COMPARISON_VALUES["uclp_delayed_growth_percent"] - PROJECT_COMPARISON_VALUES["non_uclp_delayed_growth_percent"], 2
+        ),
+        "comparison_values_status": "provisional_user_supplied_not_verified_against_full_text",
+        "study_doi": STUDY_DOI,
+        "published_abstract_summary": (
+            "The cited study abstract reports delayed skeletal growth in UCLP versus non-cleft participants and higher CVA prevalence in UCLP; "
+            "it reports 74.5% average model accuracy, up to 88% for skeletal maturity, and 83% CVA detection. "
+            "It does not provide the exact cohort percentages or 1.71-year estimate displayed here."
+        ),
+        "published_abstract_model_metrics": {
+            "average_accuracy_percent": 74.5,
+            "skeletal_maturity_accuracy_up_to_percent": 88.0,
+            "cva_detection_accuracy_percent": 83.0,
+            "note": "Metrics reported for the cited study's own models; not CLEFTSKEL-AI validation results.",
+        },
+        "patient_specific_growth_status": "not_inferred_from_cohort_statistics",
+        "clinical_note": "These are group-level presentation values, not calibrated norms or an estimate for this individual. Do not use them for diagnosis or treatment selection.",
     }
 
 
@@ -106,6 +162,12 @@ async def _predict_or_http_error(image_bytes: bytes) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Image analysis failed.") from exc
     result["clinical_guidance"] = build_growth_guidance(result)
+    result["cva_screening"] = {key: result.get(key) for key in (
+        "cva_status", "cva_model_available", "cva_probability", "cva_confidence_percent",
+        "cva_threshold", "cva_label", "cva_score_calibration", "cva_message",
+        "cva_anomaly_type_examples_not_individually_detected", "cva_subtype_detection_supported", "cva_roi_status",
+    )}
+    result["validation_summary"] = get_model_status()["validation_summary"]
     return result
 
 
@@ -326,6 +388,35 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
         return table
 
     metadata = metadata or {}
+    group_context = result.get("group_comparison") or {}
+    cva = result.get("cva_screening") or {}
+    validation = result.get("validation_summary") or {}
+    def evaluation_rows() -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        for model_key, model_title in (("cvm", "CVM classifier"), ("cva", "CVA classifier")):
+            splits = validation.get(model_key) or {}
+            for split_name in ("validation", "test"):
+                metrics = splits.get(split_name) or {}
+                accuracy = metrics.get("overall_accuracy_percent")
+                if accuracy is None:
+                    continue
+                rows.append((f"{model_title} {split_name} accuracy", f"{float(accuracy):.2f}% (n={metrics.get('sample_count', 0)})"))
+                if model_key == "cvm":
+                    per_stage = metrics.get("per_stage_accuracy") or {}
+                    rows.append((f"{model_title} {split_name} per-stage", "; ".join(f"{stage}: {values.get('accuracy_percent') if values.get('accuracy_percent') is not None else 'n/a'}% (n={values.get('support', 0)})" for stage, values in per_stage.items()) or "Unavailable"))
+                if metrics.get("cohen_kappa") is not None:
+                    rows.append((f"{model_title} {split_name} Cohen kappa", str(metrics["cohen_kappa"])))
+                if metrics.get("expected_calibration_error_percent") is not None:
+                    rows.append((f"{model_title} {split_name} ECE", f"{metrics['expected_calibration_error_percent']}% (lower is better; not calibrated certification)"))
+                if metrics.get("auc") is not None:
+                    rows.append((f"{model_title} {split_name} AUC", str(metrics["auc"])))
+        if not rows:
+            rows.append(("Local validation/test metrics", "Unavailable; train or evaluate the checkpoint on labeled validation and held-out test data."))
+        rows.extend([
+            ("Published study reference", "74.5% average accuracy; up to 88% for skeletal maturity; 83% CVA detection."),
+            ("Benchmark interpretation", "Separate study results, not this model's results. Its 88% abstract figure is not identified as CVMI-6 accuracy; tasks/cohorts may differ."),
+        ])
+        return rows
     story = [
         para(HOSPITAL_NAME, "DossierSub"),
         para("Orthodontic Growth Assessment", "DossierTitle"),
@@ -337,6 +428,7 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
             ("Patient identifier", metadata.get("patient_id") or "Not supplied"),
             ("Patient age / DOB", metadata.get("patient_age") or "Not supplied"),
             ("Treating orthodontist", metadata.get("treating_orthodontist") or "Not supplied"),
+            ("Patient group", metadata.get("patient_group_label") or "Non-Cleft"),
             ("Image filename", filename or "Uploaded image"),
             ("Image dimensions", image_size),
             ("Image size", f"{len(image_bytes) / (1024 * 1024):.2f} MB"),
@@ -350,7 +442,24 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
             ("Leading-stage score", f"{confidence:.1f}% (not calibrated clinical certainty)"),
             ("Predicted skeletal age", age_text),
             ("ROI preprocessing", result.get("roi_status", "not reported")),
+            ("CVA screening", cva.get("cva_label") or "Not evaluated"),
+            ("CVA positive score", f"{float(cva['cva_probability']):.1%} (uncalibrated)" if cva.get("cva_probability") is not None else "Unavailable"),
+            ("CVA model note", cva.get("cva_message") or "No trained binary CVA model is installed."),
+            ("Annotation examples", "; ".join(cva.get("cva_anomaly_type_examples_not_individually_detected") or []) or "Not provided"),
         ]),
+        para("Cleft / Non-Cleft Group Context", "DossierSection"),
+        section_table([
+            ("Selected cohort", group_context.get("selected_group_label", "Not specified")),
+            ("Project delayed-growth comparison", f"UCLP {PROJECT_COMPARISON_VALUES['uclp_delayed_growth_percent']:.2f}% vs non-cleft {PROJECT_COMPARISON_VALUES['non_uclp_delayed_growth_percent']:.2f}%"),
+            ("Project mean skeletal-age lag", f"{PROJECT_COMPARISON_VALUES['mean_skeletal_age_lag_years']:.2f} years"),
+            ("Project group difference", f"{PROJECT_COMPARISON_VALUES['uclp_delayed_growth_percent'] - PROJECT_COMPARISON_VALUES['non_uclp_delayed_growth_percent']:.2f} percentage points (UCLP minus non-cleft)"),
+            ("Evidence status", "Provisional project-supplied values; exact figures not verified from the publisher abstract."),
+            ("Published abstract summary", group_context.get("published_abstract_summary", "")),
+            ("Published study model metrics", "74.5% average accuracy; up to 88% for skeletal maturity; 83% CVA detection. These are the cited study's metrics, not this app's performance."),
+            ("Citation", f"Kamei et al., DOI {STUDY_DOI}"),
+        ]),
+        para("Model Validation Summary", "DossierSection"),
+        section_table(evaluation_rows()),
         para("Growth Phase Assessment", "DossierSection"),
         section_table([
             ("Growth phase", guidance["growth_phase_label"]),
@@ -375,6 +484,7 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
         "All findings and timing guidance require validation by the treating orthodontist/surgeon using the full clinical record, "
         "patient history, examination, and appropriate follow-up. Do not initiate, defer, or plan surgery solely from this report. "
         "If the age head used stage-mapped proxy targets, the displayed age is synthetic and must not be interpreted as measured skeletal age."
+        " The CVA output is binary screening only and cannot identify anomaly subtype or location. Group percentages/lag on this dossier are provisional project-supplied cohort context, not verified patient norms."
     )
     disclaimer_table = Table([[Paragraph(escape(disclaimer), styles["DossierWarning"])]], colWidths=[170 * mm])
     disclaimer_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), amber), ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#e7cb82")), ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9), ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
@@ -405,28 +515,53 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
 async def predict(
     file: UploadFile = File(...), patient_name: str | None = Form(None),
     patient_id: str | None = Form(None), patient_age: str | None = Form(None),
-    treating_orthodontist: str | None = Form(None),
+    treating_orthodontist: str | None = Form(None), patient_group: str = Form("non_uclp"),
 ):
     """Return model findings plus transparent stage-based growth guidance."""
     image_bytes = await _read_image(file)
-    metadata = _patient_metadata(patient_name, patient_id, patient_age, treating_orthodontist)
+    metadata = _patient_metadata(patient_name, patient_id, patient_age, treating_orthodontist, patient_group)
     result = await _predict_or_http_error(image_bytes)
     result["patient_metadata"] = metadata
+    result["group_comparison"] = build_group_comparison(patient_group)
     return result
+
+
+@app.post("/predict-cva")
+async def predict_cva(file: UploadFile = File(...)):
+    """Standalone modular hook for binary CVA screening."""
+    image_bytes = await _read_image(file)
+    try:
+        result = await run_in_threadpool(predict_cva_from_image, image_bytes)
+        model_status = await run_in_threadpool(get_model_status)
+        result["validation_summary"] = model_status["validation_summary"]
+        result["model_status"] = {
+            "training_status": model_status["training_status"],
+            "cvm": model_status["cvm"],
+            "cva": model_status["cva"],
+            "warnings": model_status["warnings"],
+        }
+        return result
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/download-report")
 async def download_report(
     file: UploadFile = File(...), patient_name: str | None = Form(None),
     patient_id: str | None = Form(None), patient_age: str | None = Form(None),
-    treating_orthodontist: str | None = Form(None),
+    treating_orthodontist: str | None = Form(None), patient_group: str = Form("non_uclp"),
 ):
     """Re-run inference and return the enhanced clinical research dossier PDF."""
     image_bytes = await _read_image(file)
-    metadata = _patient_metadata(patient_name, patient_id, patient_age, treating_orthodontist)
+    metadata = _patient_metadata(patient_name, patient_id, patient_age, treating_orthodontist, patient_group)
     result = await _predict_or_http_error(image_bytes)
     try:
         result["patient_metadata"] = metadata
+        result["group_comparison"] = build_group_comparison(patient_group)
         pdf_bytes = await run_in_threadpool(_make_report, image_bytes, result, file.filename or "uploaded image", metadata)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

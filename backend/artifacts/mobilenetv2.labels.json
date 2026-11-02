@@ -8,12 +8,12 @@
     6
   ],
   "stage_titles": {
-    "5": "CVM-S5",
-    "4": "CVM-S4",
-    "1": "CVM-S1",
-    "3": "CVM-S3",
-    "2": "CVM-S2",
-    "6": "CVM-S6"
+    "1": "CVMI-1",
+    "2": "CVMI-2",
+    "3": "CVMI-3",
+    "4": "CVMI-4",
+    "5": "CVMI-5",
+    "6": "CVMI-6"
   },
   "image_size": [
     224,
@@ -31,5 +31,99 @@
   },
   "roi_model_path": null,
   "roi_training_source": null,
-  "dataset_dir": "C:\\Users\\Bhumi\\Desktop\\Aariz"
+  "dataset_dir": "C:\\Users\\Bhumi\\Desktop\\Aariz",
+  "evaluation_metrics": {
+    "validation": {
+      "sample_count": 127,
+      "overall_accuracy_percent": 43.31,
+      "per_stage_accuracy": {
+        "CVMI-1": {
+          "accuracy_percent": 0.0,
+          "support": 4
+        },
+        "CVMI-2": {
+          "accuracy_percent": 25.0,
+          "support": 8
+        },
+        "CVMI-3": {
+          "accuracy_percent": 12.5,
+          "support": 8
+        },
+        "CVMI-4": {
+          "accuracy_percent": 3.33,
+          "support": 30
+        },
+        "CVMI-5": {
+          "accuracy_percent": 80.7,
+          "support": 57
+        },
+        "CVMI-6": {
+          "accuracy_percent": 25.0,
+          "support": 20
+        }
+      },
+      "cohen_kappa": 0.1126,
+      "macro_f1_percent": 24.11,
+      "multiclass_brier_score": 0.71866,
+      "expected_calibration_error_percent": 7.55,
+      "reliability_note": "Kappa is model/reference-label agreement; ECE and Brier score are uncalibrated probability diagnostics, not clinical reliability certification.",
+      "skeletal_age_regression": {
+        "sample_count": 127,
+        "mae_years": 1.23,
+        "rmse_years": 1.655,
+        "target_source": "synthetic_stage_mapping",
+        "interpretation": "Proxy-age metrics are synthetic mapping agreement, not skeletal-age clinical accuracy."
+      }
+    },
+    "test": {
+      "sample_count": 126,
+      "overall_accuracy_percent": 37.3,
+      "per_stage_accuracy": {
+        "CVMI-1": {
+          "accuracy_percent": 0.0,
+          "support": 4
+        },
+        "CVMI-2": {
+          "accuracy_percent": 25.0,
+          "support": 4
+        },
+        "CVMI-3": {
+          "accuracy_percent": 16.67,
+          "support": 6
+        },
+        "CVMI-4": {
+          "accuracy_percent": 6.25,
+          "support": 32
+        },
+        "CVMI-5": {
+          "accuracy_percent": 69.49,
+          "support": 59
+        },
+        "CVMI-6": {
+          "accuracy_percent": 9.52,
+          "support": 21
+        }
+      },
+      "cohen_kappa": -0.0107,
+      "macro_f1_percent": 19.69,
+      "multiclass_brier_score": 0.71281,
+      "expected_calibration_error_percent": 13.16,
+      "reliability_note": "Kappa is model/reference-label agreement; ECE and Brier score are uncalibrated probability diagnostics, not clinical reliability certification.",
+      "skeletal_age_regression": {
+        "sample_count": 126,
+        "mae_years": 1.346,
+        "rmse_years": 1.715,
+        "target_source": "synthetic_stage_mapping",
+        "interpretation": "Proxy-age metrics are synthetic mapping agreement, not skeletal-age clinical accuracy."
+      }
+    }
+  },
+  "published_benchmarks": {
+    "citation": "Kamei et al., DOI 10.1177/10556656241299890",
+    "average_accuracy_percent": 74.5,
+    "skeletal_maturity_accuracy_max_percent": 88.0,
+    "cva_detection_accuracy_percent": 83.0,
+    "cvmi_6_accuracy_percent": null,
+    "note": "The abstract reports up to 88% for skeletal maturity, not specifically CVMI-6. These are separate-study reference figures and are not targets achieved by this checkpoint."
+  }
 }

@@ -7,6 +7,7 @@ patient-specific treatment recommendation or a substitute for clinician review.
 from datetime import datetime, timezone
 from html import escape
 from io import BytesIO
+import base64
 import logging
 import os
 
@@ -33,6 +34,11 @@ async def lifespan(_app: FastAPI):
     )
     for warning in status["warnings"]:
         logger.warning(warning)
+    if (status.get("cva") or {}).get("state") != "ready":
+        logger.warning(
+            "CVA screening is optional and unavailable until a trained checkpoint and metadata are installed; "
+            "CVM analysis and report generation will continue."
+        )
     try:
         warmed = await run_in_threadpool(warmup_model)
         if warmed:
@@ -166,6 +172,7 @@ async def _predict_or_http_error(image_bytes: bytes) -> dict:
         "cva_status", "cva_model_available", "cva_probability", "cva_confidence_percent",
         "cva_threshold", "cva_label", "cva_score_calibration", "cva_message",
         "cva_anomaly_type_examples_not_individually_detected", "cva_subtype_detection_supported", "cva_roi_status",
+        "cva_morphology_review",
     )}
     result["validation_summary"] = get_model_status()["validation_summary"]
     return result
@@ -390,6 +397,8 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
     metadata = metadata or {}
     group_context = result.get("group_comparison") or {}
     cva = result.get("cva_screening") or {}
+    morphology = cva.get("cva_morphology_review") or {}
+    gradcam = result.get("xai_gradcam") or {}
     validation = result.get("validation_summary") or {}
     def evaluation_rows() -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
@@ -436,6 +445,31 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
         ]),
         para("AI Diagnostic Findings", "DossierSection"),
         Image(BytesIO(image_bytes), width=112 * mm, height=62 * mm, kind="proportional", hAlign="CENTER"),
+        para("Explainability: Grad-CAM", "DossierSection"),
+    ]
+    overlay_bytes = None
+    overlay_data_url = gradcam.get("overlay_data_url")
+    if isinstance(overlay_data_url, str) and overlay_data_url.startswith("data:image/jpeg;base64,"):
+        try:
+            overlay_bytes = base64.b64decode(overlay_data_url.split(",", 1)[1], validate=True)
+        except (ValueError, base64.binascii.Error):
+            overlay_bytes = None
+    if overlay_bytes:
+        visual_table = Table(
+            [[
+                Image(BytesIO(image_bytes), width=78 * mm, height=52 * mm, kind="proportional"),
+                Image(BytesIO(overlay_bytes), width=78 * mm, height=52 * mm, kind="proportional"),
+            ]],
+            colWidths=[82 * mm, 82 * mm],
+        )
+        story.extend([
+            Table([[para("Uploaded image", "DossierSmall"), para("Grad-CAM overlay", "DossierSmall")]], colWidths=[82 * mm, 82 * mm]),
+            visual_table,
+            para(gradcam.get("interpretation_note", "Grad-CAM is a coarse model activation visualization."), "DossierSmall"),
+        ])
+    else:
+        story.append(para("Grad-CAM overlay unavailable for this checkpoint/image.", "DossierSmall"))
+    story.extend([
         section_table([
             ("Predicted CVM stage", stage_label),
             ("Top 2 stage scores", f"{top2_text} (raw softmax scores; uncalibrated)"),
@@ -446,6 +480,15 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
             ("CVA positive score", f"{float(cva['cva_probability']):.1%} (uncalibrated)" if cva.get("cva_probability") is not None else "Unavailable"),
             ("CVA model note", cva.get("cva_message") or "No trained binary CVA model is installed."),
             ("Annotation examples", "; ".join(cva.get("cva_anomaly_type_examples_not_individually_detected") or []) or "Not provided"),
+            ("CVA morphology review", morphology.get("finding") or "No localized morphology review available."),
+            ("CVA morphology measurements", "; ".join(f"{key}: {value}" for key, value in (morphology.get("measurements") or {}).items()) or "Unavailable"),
+            ("Morphology limitation", morphology.get("limitation") or "No heuristic morphology output."),
+        ]),
+        para("CVA Heuristic / Morphology Notes", "DossierSection"),
+        section_table([
+            ("Analysis status", morphology.get("status", "No heuristic measurements")),
+            ("Heuristic CVA risk score", "Not generated; pixel statistics are not anatomically validated."),
+            ("Research disclaimer", morphology.get("disclaimer", "CVA findings require direct clinician review.")),
         ]),
         para("Cleft / Non-Cleft Group Context", "DossierSection"),
         section_table([
@@ -477,14 +520,14 @@ def _make_report(image_bytes: bytes, result: dict, filename: str, metadata: dict
             ("Risks / uncertainty", guidance["risks_and_uncertainties"]),
         ]),
         Spacer(1, 4 * mm),
-    ]
+    ])
 
     disclaimer = (
         "RESEARCH PROTOTYPE — NOT A DIAGNOSIS OR AUTONOMOUS TREATMENT RECOMMENDATION. "
         "All findings and timing guidance require validation by the treating orthodontist/surgeon using the full clinical record, "
         "patient history, examination, and appropriate follow-up. Do not initiate, defer, or plan surgery solely from this report. "
         "If the age head used stage-mapped proxy targets, the displayed age is synthetic and must not be interpreted as measured skeletal age."
-        " The CVA output is binary screening only and cannot identify anomaly subtype or location. Group percentages/lag on this dossier are provisional project-supplied cohort context, not verified patient norms."
+        " Any Grad-CAM image is a coarse activation visualization and does not prove causal model reasoning or anatomical localization. Generic image morphology statistics are exploratory only and do not identify CVA or estimate clinical risk. Group percentages/lag on this dossier are provisional project-supplied cohort context, not verified patient norms."
     )
     disclaimer_table = Table([[Paragraph(escape(disclaimer), styles["DossierWarning"])]], colWidths=[170 * mm])
     disclaimer_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), amber), ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#e7cb82")), ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9), ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))

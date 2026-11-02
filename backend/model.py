@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import csv
 import copy
+import base64
 import hashlib
 import io
 import json
 import logging
 import os
+import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -49,6 +51,103 @@ _prediction_cache: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
 _model_generation = 0
 _PREDICTION_CACHE_LIMIT = int(os.getenv("CLEFTSKEL_PREDICTION_CACHE_SIZE", "64"))
 logger = logging.getLogger("cleftskel.model")
+
+
+def _generate_gradcam_overlay(model, pixels: np.ndarray, source_image: Image.Image, class_index: int) -> dict[str, Any]:
+    """Create a Grad-CAM overlay for the selected CVM class on MobileNetV2's last conv map."""
+    tf = _tensorflow()
+    backbone_index = next(
+        (i for i, layer in enumerate(model.layers)
+         if isinstance(layer, tf.keras.Model) and "mobilenetv2" in layer.name.lower()),
+        None,
+    )
+    if backbone_index is None:
+        raise ValueError("Could not locate the nested MobileNetV2 backbone in the saved model.")
+    backbone = model.layers[backbone_index]
+    conv_layer = next(
+        (layer for layer in reversed(backbone.layers)
+         if getattr(getattr(layer, "output", None), "shape", None) is not None
+         and len(layer.output.shape) == 4),
+        None,
+    )
+    if conv_layer is None:
+        raise ValueError("Could not locate a spatial convolutional feature layer for Grad-CAM.")
+
+    feature_extractor = tf.keras.Model(backbone.inputs, conv_layer.output)
+    image_tensor = tf.convert_to_tensor(pixels, dtype=tf.float32)
+    with tf.GradientTape() as tape:
+        normalized = tf.keras.applications.mobilenet_v2.preprocess_input(image_tensor)
+        conv_features = feature_extractor(normalized, training=False)
+        head_output = conv_features
+        class_scores = None
+        for layer in model.layers[backbone_index + 1:]:
+            if layer.name == "skeletal_age_years":
+                continue
+            head_output = layer(head_output, training=False)
+            if layer.name == "cvm_stage":
+                class_scores = head_output
+                break
+        if class_scores is None:
+            raise ValueError("Could not connect Grad-CAM to the CVM classification head.")
+        target_score = class_scores[:, int(class_index)]
+
+    gradients = tape.gradient(target_score, conv_features)
+    if gradients is None:
+        raise ValueError("Gradients for the CVM target class were unavailable.")
+    weights = tf.reduce_mean(gradients, axis=(1, 2), keepdims=True)
+    heatmap = tf.nn.relu(tf.reduce_sum(weights * conv_features, axis=-1))[0]
+    heatmap = heatmap / (tf.reduce_max(heatmap) + tf.keras.backend.epsilon())
+    heatmap_array = np.nan_to_num(heatmap.numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+    heatmap_gray = Image.fromarray(np.uint8(np.clip(heatmap_array * 255, 0, 255)), mode="L")
+    heatmap_gray = heatmap_gray.resize(source_image.size, Image.Resampling.BILINEAR)
+    intensity = np.asarray(heatmap_gray, dtype=np.float32) / 255.0
+    # Compact jet-like color map generated with NumPy; no OpenCV dependency.
+    red = np.clip(1.5 - np.abs(4 * intensity - 3), 0, 1)
+    green = np.clip(1.5 - np.abs(4 * intensity - 2), 0, 1)
+    blue = np.clip(1.5 - np.abs(4 * intensity - 1), 0, 1)
+    colored = np.uint8(np.stack((red, green, blue), axis=-1) * 255)
+    heatmap_rgb = Image.fromarray(colored, mode="RGB")
+    source_rgb = source_image.convert("RGB")
+    overlay = Image.blend(source_rgb, heatmap_rgb, alpha=0.40)
+    output = io.BytesIO()
+    overlay.save(output, format="JPEG", quality=82, optimize=True)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return {
+        "status": "generated",
+        "target": "predicted_cvm_stage",
+        "layer": conv_layer.name,
+        "model_input_size": list(source_image.size),
+        "overlay_data_url": f"data:image/jpeg;base64,{encoded}",
+        "interpretation_note": "Coarse gradient-based activation map for the predicted CVM class. Highlighted pixels are not proof of causal reasoning, lesion location, or anatomically faithful attention.",
+    }
+
+
+def _experimental_morphology_review(image: Image.Image) -> dict[str, Any]:
+    """Return transparent generic image measurements, not a CVA probability or diagnosis."""
+    gray = np.asarray(image.convert("L").resize((224, 224), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+    grad_x = np.abs(np.diff(gray, axis=1))
+    grad_y = np.abs(np.diff(gray, axis=0))
+    threshold = float(np.percentile(np.concatenate((grad_x.ravel(), grad_y.ravel())), 75))
+    horizontal_edge_density = float(np.mean(grad_y >= threshold))
+    vertical_edge_density = float(np.mean(grad_x >= threshold))
+    edge_total = horizontal_edge_density + vertical_edge_density
+    return {
+        "status": "research_measurements_only",
+        "heuristic_risk_score": None,
+        "measurements": {
+            "analysis_crop_width_height_ratio": round(image.width / max(image.height, 1), 4),
+            "horizontal_edge_density_percent": round(horizontal_edge_density * 100, 2),
+            "vertical_edge_density_percent": round(vertical_edge_density * 100, 2),
+            "edge_orientation_ratio": round(horizontal_edge_density / edge_total, 4) if edge_total else None,
+            "grayscale_contrast_std": round(float(np.std(gray)), 5),
+        },
+        "finding": "No lesion-specific CVA finding generated.",
+        "limitation": (
+            "These global image statistics cannot identify C2-C3 fusion, atlas arch deficiency, spina bifida, "
+            "or other CVA. Anatomically localized vertebral landmarks/segmentation and expert-labeled CVA data are required."
+        ),
+        "disclaimer": "Non-diagnostic research measurements only; not a CVA risk estimate or substitute for clinician image review.",
+    }
 
 
 def _read_age_labels(age_labels_csv: str | Path | None) -> dict[str, float]:
@@ -238,6 +337,99 @@ def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
     ]
 
 
+def _coerce_cva_label(value: Any) -> int | None:
+    """Convert only explicit annotation values to the binary CVA target."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, np.integer)) and value in (0, 1):
+        return int(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "abnormal", "present", "positive", "cva"}:
+            return 1
+        if normalized in {"0", "false", "normal", "absent", "negative", "no_cva"}:
+            return 0
+    return None
+
+
+def _find_explicit_cva_annotation(value: Any) -> int | None:
+    """Search JSON only for CVA-specific fields; ignore unrelated stage labels."""
+    cva_keys = {
+        "cva", "cva_present", "cervical_vertebral_anomaly",
+        "cervical_vertebral_anomalies", "anomaly_present", "has_cva",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            if normalized_key in cva_keys:
+                label = _coerce_cva_label(item)
+                if label is not None:
+                    return label
+                if isinstance(item, dict):
+                    for nested_key in ("present", "label", "value", "status"):
+                        if nested_key in item:
+                            label = _coerce_cva_label(item[nested_key])
+                            if label is not None:
+                                return label
+            label = _find_explicit_cva_annotation(item)
+            if label is not None:
+                return label
+    elif isinstance(value, list):
+        for item in value:
+            label = _find_explicit_cva_annotation(item)
+            if label is not None:
+                return label
+    return None
+
+
+def _discover_explicit_cva_labels(
+    dataset_dir: str | Path, splits: dict[str, list[dict[str, Any]]]
+) -> dict[str, int]:
+    """Use dataset-embedded CVA labels only when explicitly annotated.
+
+    Supports CVA-specific fields in annotation JSON and filenames containing
+    explicit forms such as ``cva_positive`` or ``cva_normal``. CVM stages,
+    landmarks, and arbitrary filenames are never converted into CVA targets.
+    """
+    records = [record for rows in splits.values() for record in rows]
+    record_ids = {record["image_id"] for record in records}
+    labels: dict[str, int] = {}
+    root = Path(dataset_dir).expanduser()
+
+    for split in ("train", "valid", "test"):
+        annotation_root = root / split / "Annotations"
+        if not annotation_root.is_dir():
+            continue
+        for annotation_path in annotation_root.rglob("*.json"):
+            try:
+                annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Ignoring unreadable annotation while searching for explicit CVA labels: %s", annotation_path)
+                continue
+            image_id = str(
+                annotation.get("ceph_id") or annotation.get("cephalogram_id")
+                or annotation.get("image_id") or ""
+            ).strip()
+            if image_id in record_ids:
+                label = _find_explicit_cva_annotation(annotation)
+                if label is not None:
+                    labels[image_id] = label
+
+    label_tokens = {"positive", "negative", "normal", "abnormal", "present", "absent"}
+    cva_tokens = {"cva", "anomaly", "anomalies"}
+    for record in records:
+        if record["image_id"] in labels:
+            continue
+        tokens = set(re.split(r"[^a-z0-9]+", Path(record["image_path"]).stem.lower()))
+        if not (tokens & cva_tokens and tokens & label_tokens):
+            continue
+        if tokens & {"abnormal", "positive", "present"}:
+            labels[record["image_id"]] = 1
+        elif tokens & {"normal", "negative", "absent"}:
+            labels[record["image_id"]] = 0
+    return labels
+
+
 def train_cva_model(
     dataset_dir: str | Path,
     cva_labels_csv: str | Path | None = None,
@@ -251,50 +443,48 @@ def train_cva_model(
     Required columns: cephalogram_id,cva_present (0=normal, 1=anomaly present).
     The source image files must follow the Aariz train/valid/test directory layout.
     """
-    if cva_labels_csv is None or not str(cva_labels_csv).strip():
-        message = "CVA labels file not found. Skipping CVA training."
+    labels_path = Path(cva_labels_csv).expanduser() if cva_labels_csv and str(cva_labels_csv).strip() else None
+    if labels_path is not None and labels_path.exists() and not labels_path.is_file():
+        raise ValueError(f"CVA labels path is not a file: {labels_path}")
+
+    splits = load_aariz_dataset(dataset_dir, roi_boxes_csv=roi_boxes_csv)
+    labels: dict[str, int] = {}
+    label_source = "cva_labels_csv"
+    if labels_path is not None and labels_path.is_file():
+        with labels_path.open("r", newline="", encoding="utf-8-sig") as stream:
+            for row in csv.DictReader(stream):
+                image_id = (row.get("cephalogram_id") or row.get("image_id") or row.get("ceph_id") or "").strip()
+                raw_label = (row.get("cva_present") or row.get("label") or "").strip().lower()
+                label = _coerce_cva_label(raw_label)
+                if label is None:
+                    raise ValueError(f"Invalid CVA label {raw_label!r} for image {image_id!r}; use 0/1 or normal/abnormal.")
+                if not image_id:
+                    raise ValueError("Each CVA label row requires cephalogram_id.")
+                labels[image_id] = label
+    else:
+        message = "CVA labels CSV missing; searching dataset annotations and filenames for explicit CVA labels."
+        logger.warning(message)
+        labels = _discover_explicit_cva_labels(dataset_dir, splits)
+        label_source = "explicit_dataset_cva_annotations"
+
+    if not labels:
+        message = (
+            "CVA training skipped: no explicit CVA labels were found in the CSV, dataset annotation JSON, "
+            "or filenames. CVM stages and arbitrary filenames cannot safely serve as CVA labels."
+        )
         logger.warning(message)
         return {
             "status": "skipped",
             "skipped": True,
-            "reason": "missing_labels_file",
+            "reason": "no_explicit_cva_labels",
             "message": message,
-            "model_path": str(output_path),
+            "labels_path": str(labels_path) if labels_path else None,
+            "label_source": label_source,
             "cva_model_trained": False,
-        }
-
-    labels_path = Path(cva_labels_csv).expanduser()
-    if not labels_path.exists():
-        message = "CVA labels file not found. Skipping CVA training."
-        logger.warning("%s Path: %s", message, labels_path)
-        return {
-            "status": "skipped",
-            "skipped": True,
-            "reason": "missing_labels_file",
-            "message": message,
-            "labels_path": str(labels_path),
             "model_path": str(output_path),
-            "cva_model_trained": False,
         }
-    if not labels_path.is_file():
-        raise ValueError(f"CVA labels path is not a file: {labels_path}")
 
     tf = _tensorflow()
-    splits = load_aariz_dataset(dataset_dir, roi_boxes_csv=roi_boxes_csv)
-    labels: dict[str, int] = {}
-    with labels_path.open("r", newline="", encoding="utf-8-sig") as stream:
-        for row in csv.DictReader(stream):
-            image_id = (row.get("cephalogram_id") or row.get("image_id") or row.get("ceph_id") or "").strip()
-            raw_label = (row.get("cva_present") or row.get("label") or "").strip().lower()
-            if raw_label in {"1", "true", "abnormal", "present", "cva"}:
-                label = 1
-            elif raw_label in {"0", "false", "normal", "absent", "no_cva"}:
-                label = 0
-            else:
-                raise ValueError(f"Invalid CVA label {raw_label!r} for image {image_id!r}; use 0/1 or normal/abnormal.")
-            if not image_id:
-                raise ValueError("Each CVA label row requires cephalogram_id.")
-            labels[image_id] = label
     records_by_split = {
         split: [dict(row, cva_present=labels[row["image_id"]]) for row in rows if row["image_id"] in labels]
         for split, rows in splits.items()
@@ -304,7 +494,7 @@ def train_cva_model(
     if roi_boxes_csv and any(record.get("roi_box") is None for record in all_labeled_records):
         raise ValueError("CVA ROI training requires a normalized ROI box for every CVA-labeled image.")
     if not train_records or len({row["cva_present"] for row in train_records}) != 2:
-        raise ValueError("CVA training CSV must match train images and include both normal (0) and abnormal (1) cases.")
+        raise ValueError("CVA training requires labeled train images from both classes: normal (0) and abnormal (1).")
 
     augmenter = _training_image_augmenter()
 
@@ -344,6 +534,7 @@ def train_cva_model(
     metadata = {
         "image_size": list(IMAGE_SIZE), "class_names": {"0": "Normal", "1": "Potential CVA"},
         "label_column": "cva_present", "label_semantics": "binary_any_cva", "threshold": 0.5,
+        "label_source": label_source,
         "roi_training_enabled": bool(roi_boxes_csv),
         "anomaly_type_examples": ["C2-C3 fusion", "block fusion", "atlas spina bifida", "arch deficiency"],
         "subtype_detection_supported": False,
@@ -351,7 +542,7 @@ def train_cva_model(
     }
     destination.with_suffix(".labels.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     clear_model_cache()
-    return {"model_path": str(destination), "train_images": len(train_records), "valid_images": len(valid_records), "test_images": len(test_records), "cva_model_trained": True, "evaluation_metrics": metadata["evaluation_metrics"]}
+    return {"status": "trained", "model_path": str(destination), "label_source": label_source, "train_images": len(train_records), "valid_images": len(valid_records), "test_images": len(test_records), "cva_model_trained": True, "evaluation_metrics": metadata["evaluation_metrics"]}
 
 
 def _crop_normalized(image: Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
@@ -882,14 +1073,19 @@ def warmup_model() -> bool:
     return cvm_ready
 
 
-def _cva_result_for_pixels(pixels: np.ndarray) -> dict[str, Any]:
+def _cva_result_for_pixels(pixels: np.ndarray, source_image: Image.Image | None = None) -> dict[str, Any]:
     cva_model, cva_metadata = _get_cva_model()
     if cva_model is None:
-        return {
+        result = {
             "cva_status": "not_evaluated", "cva_model_available": False,
-            "cva_probability": None, "cva_label": None,
+            "cva_probability": None,
+            "cva_label": "Trained CVA model unavailable; research measurements only",
             "cva_message": "No trained CVA detector or CVA-annotated training set is configured.",
         }
+        result["cva_morphology_review"] = (
+            _experimental_morphology_review(source_image) if source_image is not None else None
+        )
+        return result
     raw_score = cva_model(pixels, training=False)
     score = float(np.asarray(raw_score.numpy() if hasattr(raw_score, "numpy") else raw_score).reshape(-1)[0])
     threshold = float((cva_metadata or {}).get("threshold", 0.5))
@@ -915,6 +1111,9 @@ def _apply_cva_roi_compatibility(result: dict[str, Any], roi_status: str) -> dic
     """Do not emit a CVA prediction if its trained crop input is unavailable."""
     _, metadata = _get_cva_model()
     result["cva_roi_status"] = roi_status
+    morphology = result.get("cva_morphology_review")
+    if isinstance(morphology, dict):
+        morphology["roi_status"] = roi_status
     model_expects_roi = bool(metadata and metadata.get("roi_training_enabled"))
     inference_has_roi = roi_status == "automatic_c2_c3_c4_roi"
     if metadata is not None and model_expects_roi != inference_has_roi:
@@ -936,8 +1135,6 @@ def predict_cva_from_image(image_bytes: bytes) -> dict[str, Any]:
     except (OSError, UnidentifiedImageError) as exc:
         raise ValueError("Uploaded file is not a readable image.") from exc
     model, metadata = _get_cva_model()
-    if model is None:
-        return _cva_result_for_pixels(np.zeros((1, *IMAGE_SIZE, 3), dtype=np.float32))
     roi_status = "full_image_no_localizer"
     try:
         _, cvm_metadata = _get_model()
@@ -960,7 +1157,7 @@ def predict_cva_from_image(image_bytes: bytes) -> dict[str, Any]:
     image_size = (metadata or {}).get("image_size", list(IMAGE_SIZE))
     pixels = np.ascontiguousarray(rgb.resize((image_size[1], image_size[0]), Image.Resampling.BILINEAR), dtype=np.float32)[None, ...]
     with _inference_lock:
-        result = _cva_result_for_pixels(pixels)
+        result = _cva_result_for_pixels(pixels, rgb)
     return _apply_cva_roi_compatibility(result, roi_status)
 
 
@@ -1008,7 +1205,7 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
             name: np.asarray(value.numpy() if hasattr(value, "numpy") else value)
             for name, value in raw.items()
         } if isinstance(raw, dict) else {model.output_names[0]: np.asarray(raw.numpy() if hasattr(raw, "numpy") else raw)}
-        cva_result = _cva_result_for_pixels(pixels)
+        cva_result = _cva_result_for_pixels(pixels, classifier_image)
         cva_result = _apply_cva_roi_compatibility(cva_result, roi_status)
     probabilities = np.asarray(outputs["cvm_stage"])[0]
     index = int(np.argmax(probabilities))
@@ -1028,6 +1225,22 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
     ]
     age_output = outputs.get("skeletal_age_years")
     predicted_age = float(np.asarray(age_output).reshape(-1)[0]) if age_output is not None else None
+    try:
+        with _inference_lock:
+            explainability = _generate_gradcam_overlay(model, pixels, classifier_image, index)
+        explainability["predicted_stage_label"] = metadata.get("stage_titles", {}).get(
+            str(stage_value), f"CVM-S{stage_value}"
+        )
+        explainability["roi_status"] = roi_status
+    except Exception as exc:
+        logger.warning("Grad-CAM generation failed; returning prediction without overlay: %s", exc)
+        explainability = {
+            "status": "unavailable",
+            "target": "predicted_cvm_stage",
+            "layer": None,
+            "overlay_data_url": None,
+            "interpretation_note": "Grad-CAM could not be generated for this checkpoint.",
+        }
     result = {
         "predicted_skeletal_age_years": round(predicted_age, 1) if predicted_age is not None else None,
         "cvm_stage": stage_value,
@@ -1037,6 +1250,7 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
         "cvm_stage_top2": top2,
         "confidence_calibration": "uncalibrated_softmax_scores",
         "roi_status": roi_status,
+        "xai_gradcam": explainability,
         "age_target_source": metadata.get("age_target_source"),
         "status": "complete" if predicted_age is not None else "age_labels_required",
         "message": (

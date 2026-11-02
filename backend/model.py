@@ -12,6 +12,7 @@ import copy
 import hashlib
 import io
 import json
+import logging
 import os
 import threading
 from collections import OrderedDict
@@ -24,17 +25,30 @@ from PIL import Image, UnidentifiedImageError
 DEFAULT_DATASET_DIR = Path(os.getenv("CLEFTSKEL_DATASET_DIR", r"C:\Users\Bhumi\Desktop\Aariz"))
 MODEL_PATH = Path(os.getenv("CLEFTSKEL_MODEL_PATH", Path(__file__).parent / "artifacts" / "mobilenetv2.keras"))
 LABELS_PATH = MODEL_PATH.with_suffix(".labels.json")
+DEFAULT_CVA_MODEL_PATH = Path(os.getenv("CLEFTSKEL_CVA_MODEL_PATH", Path(__file__).parent / "artifacts" / "mobilenetv2_cva.keras"))
+CVA_LABELS_PATH = DEFAULT_CVA_MODEL_PATH.with_suffix(".labels.json")
 ROI_MODEL_PATH = MODEL_PATH.with_name(f"{MODEL_PATH.stem}_roi.keras")
 IMAGE_SIZE = (224, 224)
+PUBLISHED_BENCHMARKS = {
+    "citation": "Kamei et al., DOI 10.1177/10556656241299890",
+    "average_accuracy_percent": 74.5,
+    "skeletal_maturity_accuracy_max_percent": 88.0,
+    "cva_detection_accuracy_percent": 83.0,
+    "cvmi_6_accuracy_percent": None,
+    "note": "The abstract reports up to 88% for skeletal maturity, not specifically CVMI-6. These are separate-study reference figures and are not targets achieved by this checkpoint.",
+}
 _loaded_model = None
 _loaded_metadata: dict[str, Any] | None = None
 _loaded_roi_model = None
+_loaded_cva_model = None
+_loaded_cva_metadata: dict[str, Any] | None = None
 _load_lock = threading.Lock()
 _inference_lock = threading.Lock()
 _cache_lock = threading.Lock()
 _prediction_cache: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
 _model_generation = 0
 _PREDICTION_CACHE_LIMIT = int(os.getenv("CLEFTSKEL_PREDICTION_CACHE_SIZE", "64"))
+logger = logging.getLogger("cleftskel.model")
 
 
 def _read_age_labels(age_labels_csv: str | Path | None) -> dict[str, float]:
@@ -180,6 +194,166 @@ def build_roi_localizer(imagenet_weights: str | None = "imagenet"):
     return model
 
 
+def build_cva_classifier(imagenet_weights: str | None = "imagenet"):
+    """Build the separate MobileNetV2 binary head (0=normal, 1=CVA present)."""
+    tf = _tensorflow()
+    inputs = tf.keras.Input(shape=(*IMAGE_SIZE, 3), name="image")
+    x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
+    backbone = tf.keras.applications.MobileNetV2(input_shape=(*IMAGE_SIZE, 3), include_top=False, weights=imagenet_weights)
+    backbone.trainable = False
+    x = backbone(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.25)(x)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid", name="cva_present")(x)
+    model = tf.keras.Model(inputs, outputs, name="mobilenetv2_cva_binary")
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss="binary_crossentropy", metrics=["accuracy", tf.keras.metrics.AUC(name="auc")])
+    return model
+
+
+def _training_image_augmenter():
+    """Construct the requested clinical-image training augmentation pipeline."""
+    tf = _tensorflow()
+    return tf.keras.preprocessing.image.ImageDataGenerator(
+        rotation_range=15,
+        width_shift_range=0.10,
+        height_shift_range=0.10,
+        zoom_range=0.10,
+        horizontal_flip=True,
+        fill_mode="nearest",
+    )
+
+
+def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    monitor = "val_loss" if validation_available else "loss"
+    return [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(destination), monitor=monitor, mode="min",
+            save_best_only=True, save_weights_only=False, verbose=1,
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor=monitor, mode="min", patience=10, restore_best_weights=True,
+            verbose=1,
+        ),
+    ]
+
+
+def train_cva_model(
+    dataset_dir: str | Path,
+    cva_labels_csv: str | Path | None = None,
+    output_path: str | Path = DEFAULT_CVA_MODEL_PATH,
+    epochs: int = 120,
+    batch_size: int = 16,
+    roi_boxes_csv: str | Path | None = None,
+) -> dict[str, Any]:
+    """Train the independent binary CVA model from a cva_present CSV.
+
+    Required columns: cephalogram_id,cva_present (0=normal, 1=anomaly present).
+    The source image files must follow the Aariz train/valid/test directory layout.
+    """
+    if cva_labels_csv is None or not str(cva_labels_csv).strip():
+        message = "CVA labels file not found. Skipping CVA training."
+        logger.warning(message)
+        return {
+            "status": "skipped",
+            "skipped": True,
+            "reason": "missing_labels_file",
+            "message": message,
+            "model_path": str(output_path),
+            "cva_model_trained": False,
+        }
+
+    labels_path = Path(cva_labels_csv).expanduser()
+    if not labels_path.exists():
+        message = "CVA labels file not found. Skipping CVA training."
+        logger.warning("%s Path: %s", message, labels_path)
+        return {
+            "status": "skipped",
+            "skipped": True,
+            "reason": "missing_labels_file",
+            "message": message,
+            "labels_path": str(labels_path),
+            "model_path": str(output_path),
+            "cva_model_trained": False,
+        }
+    if not labels_path.is_file():
+        raise ValueError(f"CVA labels path is not a file: {labels_path}")
+
+    tf = _tensorflow()
+    splits = load_aariz_dataset(dataset_dir, roi_boxes_csv=roi_boxes_csv)
+    labels: dict[str, int] = {}
+    with labels_path.open("r", newline="", encoding="utf-8-sig") as stream:
+        for row in csv.DictReader(stream):
+            image_id = (row.get("cephalogram_id") or row.get("image_id") or row.get("ceph_id") or "").strip()
+            raw_label = (row.get("cva_present") or row.get("label") or "").strip().lower()
+            if raw_label in {"1", "true", "abnormal", "present", "cva"}:
+                label = 1
+            elif raw_label in {"0", "false", "normal", "absent", "no_cva"}:
+                label = 0
+            else:
+                raise ValueError(f"Invalid CVA label {raw_label!r} for image {image_id!r}; use 0/1 or normal/abnormal.")
+            if not image_id:
+                raise ValueError("Each CVA label row requires cephalogram_id.")
+            labels[image_id] = label
+    records_by_split = {
+        split: [dict(row, cva_present=labels[row["image_id"]]) for row in rows if row["image_id"] in labels]
+        for split, rows in splits.items()
+    }
+    train_records = records_by_split.get("train", [])
+    all_labeled_records = [record for rows in records_by_split.values() for record in rows]
+    if roi_boxes_csv and any(record.get("roi_box") is None for record in all_labeled_records):
+        raise ValueError("CVA ROI training requires a normalized ROI box for every CVA-labeled image.")
+    if not train_records or len({row["cva_present"] for row in train_records}) != 2:
+        raise ValueError("CVA training CSV must match train images and include both normal (0) and abnormal (1) cases.")
+
+    augmenter = _training_image_augmenter()
+
+    def dataset(records: list[dict[str, Any]], shuffle: bool):
+        def generator():
+            for record in records:
+                with Image.open(record["image_path"]) as source:
+                    rgb = source.convert("RGB")
+                    if record.get("roi_box"):
+                        rgb = _crop_normalized(rgb, record["roi_box"])
+                    pixels = np.ascontiguousarray(rgb.resize((IMAGE_SIZE[1], IMAGE_SIZE[0]), Image.Resampling.BILINEAR), dtype=np.float32)
+                    if shuffle:
+                        pixels = augmenter.random_transform(pixels)
+                    yield pixels, np.asarray([record["cva_present"]], dtype=np.float32)
+        ds = tf.data.Dataset.from_generator(
+            generator,
+            output_signature=(tf.TensorSpec(shape=(*IMAGE_SIZE, 3), dtype=tf.float32), tf.TensorSpec(shape=(1,), dtype=tf.float32)),
+        )
+        if shuffle:
+            ds = ds.shuffle(min(len(records), 1000), reshuffle_each_iteration=True)
+        return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    valid_records = records_by_split.get("valid", [])
+    test_records = records_by_split.get("test", [])
+    model = build_cva_classifier()
+    destination = Path(output_path)
+    callbacks = _checkpoint_callbacks(tf, destination, bool(valid_records))
+    model.fit(
+        dataset(train_records, True), validation_data=dataset(valid_records, False) if valid_records else None,
+        epochs=epochs, callbacks=callbacks,
+    )
+    # Always evaluate and publish the best checkpoint, not just the final epoch.
+    model = tf.keras.models.load_model(destination)
+    validation_metrics = _evaluate_cva_records(model, valid_records, bool(roi_boxes_csv))
+    test_metrics = _evaluate_cva_records(model, test_records, bool(roi_boxes_csv))
+    logger.info("CVA validation metrics: %s", json.dumps({"validation": validation_metrics, "test": test_metrics}))
+    metadata = {
+        "image_size": list(IMAGE_SIZE), "class_names": {"0": "Normal", "1": "Potential CVA"},
+        "label_column": "cva_present", "label_semantics": "binary_any_cva", "threshold": 0.5,
+        "roi_training_enabled": bool(roi_boxes_csv),
+        "anomaly_type_examples": ["C2-C3 fusion", "block fusion", "atlas spina bifida", "arch deficiency"],
+        "subtype_detection_supported": False,
+        "evaluation_metrics": {"validation": validation_metrics, "test": test_metrics},
+    }
+    destination.with_suffix(".labels.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    clear_model_cache()
+    return {"model_path": str(destination), "train_images": len(train_records), "valid_images": len(valid_records), "test_images": len(test_records), "cva_model_trained": True, "evaluation_metrics": metadata["evaluation_metrics"]}
+
+
 def _crop_normalized(image: Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
     """Crop a normalized x0,y0,x1,y1 box, expanding slightly for context."""
     width, height = image.size
@@ -194,12 +368,226 @@ def _crop_normalized(image: Image.Image, box: tuple[float, float, float, float])
     return image.crop((left, top, right, bottom))
 
 
-def train_model(
+def _cohen_kappa(y_true: list[int], y_pred: list[int], labels: list[int]) -> float | None:
+    if not y_true:
+        return None
+    matrix = {truth: {pred: 0 for pred in labels} for truth in labels}
+    for truth, pred in zip(y_true, y_pred):
+        matrix[truth][pred] += 1
+    total = len(y_true)
+    observed = sum(matrix[label][label] for label in labels) / total
+    expected = sum(
+        (sum(matrix[label].values()) / total)
+        * (sum(matrix[row][label] for row in labels) / total)
+        for label in labels
+    )
+    return None if abs(1 - expected) < 1e-12 else float((observed - expected) / (1 - expected))
+
+
+def _classification_summary(y_true: list[int], probabilities: np.ndarray, labels: list[int], class_names: dict[str, str]) -> dict[str, Any]:
+    if not y_true:
+        return {"sample_count": 0, "overall_accuracy_percent": None, "per_stage_accuracy": {}, "cohen_kappa": None, "macro_f1_percent": None, "multiclass_brier_score": None, "expected_calibration_error_percent": None}
+    predictions = np.argmax(probabilities, axis=1).astype(int).tolist()
+    class_indices = list(range(len(labels)))
+    correct = sum(actual == predicted for actual, predicted in zip(y_true, predictions))
+    per_stage = {}
+    f1_values = []
+    for index, label in zip(class_indices, labels):
+        support = sum(actual == index for actual in y_true)
+        tp = sum(actual == index and predicted == index for actual, predicted in zip(y_true, predictions))
+        fp = sum(actual != index and predicted == index for actual, predicted in zip(y_true, predictions))
+        fn = support - tp
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / support if support else None
+        f1 = (2 * precision * recall / (precision + recall)) if recall is not None and precision + recall else 0.0
+        if support:
+            f1_values.append(f1)
+        per_stage[class_names.get(str(label), f"CVMI-{label}")] = {
+            "accuracy_percent": round(recall * 100, 2) if recall is not None else None,
+            "support": support,
+        }
+    one_hot = np.eye(len(labels), dtype=np.float64)[np.asarray(y_true, dtype=np.int64)]
+    brier = float(np.mean(np.sum((probabilities.astype(np.float64) - one_hot) ** 2, axis=1)))
+    confidence = probabilities.max(axis=1)
+    is_correct = (np.asarray(y_true) == np.asarray(predictions)).astype(np.float64)
+    ece = 0.0
+    for lower in np.linspace(0, 0.9, 10):
+        mask = (confidence >= lower) & (confidence < lower + 0.1 if lower < 0.9 else confidence <= 1.0)
+        if np.any(mask):
+            ece += float(mask.mean()) * abs(float(is_correct[mask].mean()) - float(confidence[mask].mean()))
+    return {
+        "sample_count": len(y_true),
+        "overall_accuracy_percent": round(correct / len(y_true) * 100, 2),
+        "per_stage_accuracy": per_stage,
+        "cohen_kappa": round(_cohen_kappa(y_true, predictions, class_indices), 4) if len(class_indices) > 1 else None,
+        "macro_f1_percent": round(float(np.mean(f1_values)) * 100, 2) if f1_values else None,
+        "multiclass_brier_score": round(brier, 5),
+        "expected_calibration_error_percent": round(ece * 100, 2),
+        "reliability_note": "Kappa is model/reference-label agreement; ECE and Brier score are uncalibrated probability diagnostics, not clinical reliability certification.",
+    }
+
+
+def _evaluate_cvm_records(
+    model, records: list[dict[str, Any]], stage_values: list[int], stage_titles: dict[str, str],
+    image_size: tuple[int, int], use_roi: bool, age_target_source: str | None = None,
+    stage_age_map: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    y_true: list[int] = []
+    probabilities: list[np.ndarray] = []
+    true_ages: list[float] = []
+    predicted_ages: list[float] = []
+    index_by_stage = {stage: index for index, stage in enumerate(stage_values)}
+    for record in records:
+        with Image.open(record["image_path"]) as source:
+            image = source.convert("RGB")
+            if use_roi:
+                if record.get("roi_box") is None:
+                    raise ValueError(f"Held-out evaluation requires an annotated ROI for {record['image_id']}.")
+                image = _crop_normalized(image, record["roi_box"])
+            pixels = np.ascontiguousarray(image.resize((image_size[1], image_size[0]), Image.Resampling.BILINEAR), dtype=np.float32)[None, ...]
+        raw = model(pixels, training=False)
+        outputs = {name: np.asarray(value.numpy() if hasattr(value, "numpy") else value) for name, value in raw.items()} if isinstance(raw, dict) else {model.output_names[0]: np.asarray(raw.numpy() if hasattr(raw, "numpy") else raw)}
+        y_true.append(index_by_stage[record["cvm_stage"]])
+        probabilities.append(np.asarray(outputs["cvm_stage"])[0])
+        if outputs.get("skeletal_age_years") is not None:
+            target = record.get("skeletal_age_years")
+            if target is None and stage_age_map:
+                target = stage_age_map.get(str(record["cvm_stage"]))
+            if target is not None:
+                true_ages.append(float(target))
+                predicted_ages.append(float(np.asarray(outputs["skeletal_age_years"]).reshape(-1)[0]))
+    class_metrics = _classification_summary(y_true, np.asarray(probabilities), stage_values, stage_titles) if records else _classification_summary([], np.empty((0, len(stage_values))), stage_values, stage_titles)
+    age_metrics = None
+    if true_ages:
+        errors = np.asarray(predicted_ages) - np.asarray(true_ages)
+        age_metrics = {
+            "sample_count": len(true_ages), "mae_years": round(float(np.mean(np.abs(errors))), 3),
+            "rmse_years": round(float(np.sqrt(np.mean(errors ** 2))), 3),
+            "target_source": age_target_source,
+            "interpretation": "Proxy-age metrics are synthetic mapping agreement, not skeletal-age clinical accuracy." if age_target_source == "synthetic_stage_mapping" else "Age-head error against supplied age labels; clinical validity requires external validation.",
+        }
+    class_metrics["skeletal_age_regression"] = age_metrics
+    return class_metrics
+
+
+def _evaluate_cva_records(model, records: list[dict[str, Any]], use_roi: bool) -> dict[str, Any]:
+    y_true: list[int] = []
+    scores: list[float] = []
+    for record in records:
+        with Image.open(record["image_path"]) as source:
+            image = source.convert("RGB")
+            if use_roi:
+                if record.get("roi_box") is None:
+                    raise ValueError(f"Held-out CVA evaluation requires an annotated ROI for {record['image_id']}.")
+                image = _crop_normalized(image, record["roi_box"])
+            pixels = np.ascontiguousarray(image.resize((IMAGE_SIZE[1], IMAGE_SIZE[0]), Image.Resampling.BILINEAR), dtype=np.float32)[None, ...]
+        score = model(pixels, training=False)
+        scores.append(float(np.asarray(score.numpy() if hasattr(score, "numpy") else score).reshape(-1)[0]))
+        y_true.append(int(record["cva_present"]))
+    if not records:
+        return {"sample_count": 0, "overall_accuracy_percent": None, "sensitivity_percent": None, "specificity_percent": None, "cohen_kappa": None, "macro_f1_percent": None, "auc": None, "brier_score": None}
+    predictions = [int(score >= 0.5) for score in scores]
+    tp = sum(a == 1 and p == 1 for a, p in zip(y_true, predictions))
+    tn = sum(a == 0 and p == 0 for a, p in zip(y_true, predictions))
+    positives, negatives = sum(y_true), len(y_true) - sum(y_true)
+    auc = None
+    if positives and negatives:
+        positive_scores = [score for score, label in zip(scores, y_true) if label == 1]
+        negative_scores = [score for score, label in zip(scores, y_true) if label == 0]
+        auc = sum((pos > neg) + 0.5 * (pos == neg) for pos in positive_scores for neg in negative_scores) / (positives * negatives)
+    f1_values = []
+    for label in (0, 1):
+        tp_class = sum(actual == label and predicted == label for actual, predicted in zip(y_true, predictions))
+        fp_class = sum(actual != label and predicted == label for actual, predicted in zip(y_true, predictions))
+        fn_class = sum(actual == label and predicted != label for actual, predicted in zip(y_true, predictions))
+        denom = 2 * tp_class + fp_class + fn_class
+        f1_values.append(2 * tp_class / denom if denom else 0.0)
+    return {
+        "sample_count": len(y_true), "overall_accuracy_percent": round((tp + tn) / len(y_true) * 100, 2),
+        "sensitivity_percent": round(tp / positives * 100, 2) if positives else None,
+        "specificity_percent": round(tn / negatives * 100, 2) if negatives else None,
+        "cohen_kappa": round(_cohen_kappa(y_true, predictions, [0, 1]), 4),
+        "macro_f1_percent": round(float(np.mean(f1_values)) * 100, 2),
+        "auc": round(float(auc), 4) if auc is not None else None,
+        "brier_score": round(float(np.mean((np.asarray(scores) - np.asarray(y_true)) ** 2)), 5),
+        "reliability_note": "Kappa is model/reference-label agreement. AUC and Brier score are uncalibrated screening diagnostics, not clinical reliability certification.",
+    }
+
+
+def evaluate_saved_models(
+    dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    model_path: str | Path = MODEL_PATH,
+    age_labels_csv: str | Path | None = None,
+    roi_boxes_csv: str | Path | None = None,
+    cva_labels_csv: str | Path | None = None,
+    cva_model_path: str | Path = DEFAULT_CVA_MODEL_PATH,
+    metrics_output: str | Path | None = None,
+) -> dict[str, Any]:
+    """Evaluate saved checkpoints on validation and held-out test partitions."""
+    cvm_path = Path(model_path)
+    cvm_labels = cvm_path.with_suffix(".labels.json")
+    if not cvm_path.is_file() or not cvm_labels.is_file():
+        raise FileNotFoundError(f"CVM checkpoint and sidecar are required: {cvm_path} / {cvm_labels}")
+    splits = load_aariz_dataset(dataset_dir, age_labels_csv, roi_boxes_csv)
+    metadata = json.loads(cvm_labels.read_text(encoding="utf-8"))
+    cvm_model = _tensorflow().keras.models.load_model(cvm_path)
+    stages = [int(value) for value in metadata["stage_values"]]
+    class_titles = metadata.get("stage_titles", {})
+    use_roi = bool(metadata.get("roi_training_source"))
+    evaluation = {
+        "validation": _evaluate_cvm_records(cvm_model, splits.get("valid", []), stages, class_titles, tuple(metadata.get("image_size", IMAGE_SIZE)), use_roi, metadata.get("age_target_source"), metadata.get("stage_age_map")),
+        "test": _evaluate_cvm_records(cvm_model, splits.get("test", []), stages, class_titles, tuple(metadata.get("image_size", IMAGE_SIZE)), use_roi, metadata.get("age_target_source"), metadata.get("stage_age_map")),
+    }
+    metadata["evaluation_metrics"] = evaluation
+    metadata["published_benchmarks"] = PUBLISHED_BENCHMARKS
+    cvm_labels.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    result: dict[str, Any] = {"cvm": evaluation, "published_benchmarks": PUBLISHED_BENCHMARKS}
+
+    if cva_labels_csv:
+        cva_path = Path(cva_model_path)
+        cva_sidecar = cva_path.with_suffix(".labels.json")
+        if not cva_path.is_file() or not cva_sidecar.is_file():
+            raise FileNotFoundError(f"CVA checkpoint and sidecar are required: {cva_path} / {cva_sidecar}")
+        cva_meta = json.loads(cva_sidecar.read_text(encoding="utf-8"))
+        labels: dict[str, int] = {}
+        with Path(cva_labels_csv).open("r", newline="", encoding="utf-8-sig") as stream:
+            for row in csv.DictReader(stream):
+                image_id = (row.get("cephalogram_id") or row.get("image_id") or row.get("ceph_id") or "").strip()
+                raw = (row.get("cva_present") or row.get("label") or "").strip().lower()
+                if raw in {"1", "true", "abnormal", "present", "cva"}:
+                    labels[image_id] = 1
+                elif raw in {"0", "false", "normal", "absent", "no_cva"}:
+                    labels[image_id] = 0
+                elif image_id:
+                    raise ValueError(f"Invalid CVA label {raw!r} for {image_id}.")
+        labeled_splits = {
+            split: [dict(record, cva_present=labels[record["image_id"]]) for record in rows if record["image_id"] in labels]
+            for split, rows in splits.items()
+        }
+        cva_model = _tensorflow().keras.models.load_model(cva_path)
+        cva_evaluation = {
+            "validation": _evaluate_cva_records(cva_model, labeled_splits.get("valid", []), bool(cva_meta.get("roi_training_enabled"))),
+            "test": _evaluate_cva_records(cva_model, labeled_splits.get("test", []), bool(cva_meta.get("roi_training_enabled"))),
+        }
+        cva_meta["evaluation_metrics"] = cva_evaluation
+        cva_meta["published_benchmarks"] = PUBLISHED_BENCHMARKS
+        cva_sidecar.write_text(json.dumps(cva_meta, indent=2), encoding="utf-8")
+        result["cva"] = cva_evaluation
+    logger.info("Saved-checkpoint evaluation metrics: %s", json.dumps(result))
+    report_path = Path(metrics_output) if metrics_output else Path(__file__).parent / "artifacts" / "evaluation_metrics.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    result["metrics_json_path"] = str(report_path)
+    report_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    clear_model_cache()
+    return result
+
+
+def train_cvmi_model(
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
     output_path: str | Path = MODEL_PATH,
     age_labels_csv: str | Path | None = None,
     stage_age_map: dict[int, float] | None = None,
-    epochs: int = 15,
+    epochs: int = 100,
     batch_size: int = 16,
     image_size: tuple[int, int] = IMAGE_SIZE,
     roi_boxes_csv: str | Path | None = None,
@@ -208,8 +596,8 @@ def train_model(
     tf = _tensorflow()
     splits = load_aariz_dataset(dataset_dir, age_labels_csv, roi_boxes_csv)
     stage_values = sorted({r["cvm_stage"] for r in splits["train"]})
-    if len(stage_values) < 2:
-        raise ValueError("At least two CVM stages are required to train a classifier.")
+    if stage_values != [1, 2, 3, 4, 5, 6]:
+        raise ValueError(f"CVM classifier requires labeled CVMI stages 1 through 6; found {stage_values}.")
     age_training_records = splits["train"] + splits.get("valid", [])
     has_direct_age = bool(age_training_records) and all(r["skeletal_age_years"] is not None for r in age_training_records)
     mapped_age_map = {int(key): float(value) for key, value in (stage_age_map or {}).items()}
@@ -256,6 +644,8 @@ def train_model(
         roi_destination.parent.mkdir(parents=True, exist_ok=True)
         roi_model.save(roi_destination)
 
+    augmenter = _training_image_augmenter()
+
     def make_dataset(records, shuffle: bool):
         if not records:
             return None
@@ -269,17 +659,19 @@ def train_model(
                             rgb = _crop_normalized(rgb, record["roi_box"])
                         rgb = rgb.resize((image_size[1], image_size[0]))
                         pixels = np.asarray(rgb, dtype=np.float32)
+                        if shuffle:
+                            pixels = augmenter.random_transform(pixels)
                 except (OSError, UnidentifiedImageError) as exc:
                     raise ValueError(f"Could not read image {record['image_path']}: {exc}") from exc
                 label = {"cvm_stage": np.int32(stage_to_index[record["cvm_stage"]])}
                 if has_age:
                     target = record["skeletal_age_years"] if has_direct_age else mapped_age_map[record["cvm_stage"]]
-                    label["skeletal_age_years"] = np.float32(target)
+                    label["skeletal_age_years"] = np.asarray([target], dtype=np.float32)
                 yield pixels, label
 
         output_signature = (
             tf.TensorSpec(shape=(*image_size, 3), dtype=tf.float32),
-            {"cvm_stage": tf.TensorSpec(shape=(), dtype=tf.int32), **({"skeletal_age_years": tf.TensorSpec(shape=(), dtype=tf.float32)} if has_age else {})},
+            {"cvm_stage": tf.TensorSpec(shape=(), dtype=tf.int32), **({"skeletal_age_years": tf.TensorSpec(shape=(1,), dtype=tf.float32)} if has_age else {})},
         )
         dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
         if shuffle:
@@ -289,15 +681,21 @@ def train_model(
     train_ds = make_dataset(splits["train"], shuffle=True)
     valid_ds = make_dataset(splits.get("valid", []), shuffle=False)
     model = build_mobilenetv2_model(stage_values, train_age_head=has_age)
-    callbacks = [tf.keras.callbacks.EarlyStopping(monitor="val_loss" if valid_ds else "loss", patience=4, restore_best_weights=True)]
-    model.fit(train_ds, validation_data=valid_ds, epochs=epochs, callbacks=callbacks)
-
     destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    model.save(destination)
+    callbacks = _checkpoint_callbacks(tf, destination, valid_ds is not None)
+    model.fit(train_ds, validation_data=valid_ds, epochs=epochs, callbacks=callbacks)
+    # Reload the best ModelCheckpoint artifact so metrics and sidecar describe it.
+    model = tf.keras.models.load_model(destination)
+
+    stage_titles = {str(stage): f"CVMI-{stage}" for stage in stage_values}
+    age_map_for_eval = {str(key): value for key, value in mapped_age_map.items()} if has_mapped_age else None
+    validation_metrics = _evaluate_cvm_records(model, splits.get("valid", []), stage_values, stage_titles, image_size, has_roi_labels, age_target_source, age_map_for_eval)
+    test_metrics = _evaluate_cvm_records(model, splits.get("test", []), stage_values, stage_titles, image_size, has_roi_labels, age_target_source, age_map_for_eval)
+    logger.info("CVM validation metrics: %s", json.dumps({"validation": validation_metrics, "test": test_metrics}))
+
     metadata = {
         "stage_values": stage_values,
-        "stage_titles": {str(r["cvm_stage"]): r["cvm_stage_title"] for r in splits["train"]},
+        "stage_titles": stage_titles,
         "image_size": list(image_size),
         "has_skeletal_age_head": has_age,
         "age_target_source": age_target_source,
@@ -305,17 +703,25 @@ def train_model(
         "roi_model_path": roi_destination.name if has_roi_labels else None,
         "roi_training_source": "c2_c3_c4_box_annotations" if has_roi_labels else None,
         "dataset_dir": str(Path(dataset_dir).resolve()),
+        "evaluation_metrics": {"validation": validation_metrics, "test": test_metrics},
+        "published_benchmarks": PUBLISHED_BENCHMARKS,
     }
     destination.with_suffix(".labels.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     clear_model_cache()
-    return {"model_path": str(destination), "train_images": len(splits["train"]), "valid_images": len(splits.get("valid", [])), "cvm_stages": stage_values, "skeletal_age_head_trained": has_age, "age_target_source": age_target_source, "roi_localizer_trained": has_roi_labels, "roi_model_path": str(roi_destination) if has_roi_labels else None}
+    return {"model_path": str(destination), "train_images": len(splits["train"]), "valid_images": len(splits.get("valid", [])), "test_images": len(splits.get("test", [])), "cvm_stages": stage_values, "skeletal_age_head_trained": has_age, "age_target_source": age_target_source, "roi_localizer_trained": has_roi_labels, "roi_model_path": str(roi_destination) if has_roi_labels else None, "evaluation_metrics": metadata["evaluation_metrics"], "published_benchmarks": PUBLISHED_BENCHMARKS}
+
+
+# Backward-compatible function name used by earlier project scripts.
+train_model = train_cvmi_model
 
 
 def clear_model_cache() -> None:
-    global _loaded_model, _loaded_metadata, _loaded_roi_model, _model_generation
+    global _loaded_model, _loaded_metadata, _loaded_roi_model, _loaded_cva_model, _loaded_cva_metadata, _model_generation
     _loaded_model = None
     _loaded_metadata = None
     _loaded_roi_model = None
+    _loaded_cva_model = None
+    _loaded_cva_metadata = None
     with _cache_lock:
         _model_generation += 1
         _prediction_cache.clear()
@@ -357,6 +763,85 @@ def _get_roi_model(metadata: dict[str, Any]):
     return _loaded_roi_model
 
 
+def _get_cva_model():
+    """Return the independent CVA detector, or (None, None) if not trained."""
+    global _loaded_cva_model, _loaded_cva_metadata
+    if _loaded_cva_model is not None:
+        return _loaded_cva_model, _loaded_cva_metadata
+    if not DEFAULT_CVA_MODEL_PATH.is_file() or not CVA_LABELS_PATH.is_file():
+        return None, None
+    with _load_lock:
+        if _loaded_cva_model is None:
+            _loaded_cva_model = _tensorflow().keras.models.load_model(DEFAULT_CVA_MODEL_PATH)
+            _loaded_cva_metadata = json.loads(CVA_LABELS_PATH.read_text(encoding="utf-8"))
+    return _loaded_cva_model, _loaded_cva_metadata
+
+
+def get_model_status() -> dict[str, Any]:
+    """Inspect checkpoint and sidecar availability without loading TensorFlow models."""
+    warnings: list[str] = []
+    status: dict[str, Any] = {"cvm": {}, "cva": {}, "roi": {}, "warnings": warnings}
+    cvm_sidecar: dict[str, Any] = {}
+    cva_sidecar: dict[str, Any] = {}
+    status["cvm"] = {
+        "weights_present": MODEL_PATH.is_file(), "metadata_present": LABELS_PATH.is_file(),
+        "state": "ready" if MODEL_PATH.is_file() and LABELS_PATH.is_file() else "missing_artifact",
+        "weights_path": str(MODEL_PATH),
+    }
+    if not MODEL_PATH.is_file():
+        warnings.append(f"CVM model weights missing: {MODEL_PATH}. Train the CVMI model before inference.")
+    elif not LABELS_PATH.is_file():
+        status["cvm"]["state"] = "metadata_missing"
+        warnings.append(f"CVM model metadata missing: {LABELS_PATH}.")
+    else:
+        try:
+            cvm_sidecar = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+            status["cvm"]["validation_metrics"] = cvm_sidecar.get("evaluation_metrics")
+        except (OSError, json.JSONDecodeError) as exc:
+            status["cvm"]["state"] = "metadata_invalid"
+            warnings.append(f"CVM model metadata could not be read: {exc}")
+    roi_relative = cvm_sidecar.get("roi_model_path")
+    roi_path = Path(roi_relative) if roi_relative else None
+    if roi_path is not None and not roi_path.is_absolute():
+        roi_path = MODEL_PATH.parent / roi_path
+    roi_present = roi_path.is_file() if roi_path else False
+    status["roi"] = {"required_by_checkpoint": bool(roi_relative), "weights_present": roi_present, "state": "ready" if not roi_relative or roi_present else "missing", "weights_path": str(roi_path) if roi_path else None}
+    if roi_relative and not roi_present:
+        warnings.append(f"ROI localizer weights missing: {roi_path}; inference may use its full-image fallback.")
+
+    status["cva"] = {
+        "weights_present": DEFAULT_CVA_MODEL_PATH.is_file(), "metadata_present": CVA_LABELS_PATH.is_file(),
+        "state": "ready" if DEFAULT_CVA_MODEL_PATH.is_file() and CVA_LABELS_PATH.is_file() else "unavailable",
+        "weights_path": str(DEFAULT_CVA_MODEL_PATH),
+    }
+    if not DEFAULT_CVA_MODEL_PATH.is_file():
+        warnings.append(f"CVA model weights missing: {DEFAULT_CVA_MODEL_PATH}; CVA predictions will be reported as not evaluated.")
+    elif not CVA_LABELS_PATH.is_file():
+        status["cva"]["state"] = "metadata_missing"
+        warnings.append(f"CVA model metadata missing: {CVA_LABELS_PATH}; CVA predictions will be reported as not evaluated.")
+    else:
+        try:
+            cva_sidecar = json.loads(CVA_LABELS_PATH.read_text(encoding="utf-8"))
+            status["cva"]["validation_metrics"] = cva_sidecar.get("evaluation_metrics")
+        except (OSError, json.JSONDecodeError) as exc:
+            status["cva"]["state"] = "metadata_invalid"
+            warnings.append(f"CVA model metadata could not be read: {exc}")
+    status["published_benchmarks"] = PUBLISHED_BENCHMARKS
+    status["ready"] = status["cvm"]["state"] == "ready"
+    status["training_status"] = (
+        "training_required" if not status["ready"]
+        else "ready" if status["cva"]["state"] == "ready"
+        else "partial"
+    )
+    status["validation_summary"] = {
+        "cvm": cvm_sidecar.get("evaluation_metrics"),
+        "cva": cva_sidecar.get("evaluation_metrics"),
+        "published_reference": PUBLISHED_BENCHMARKS,
+        "comparability_note": "Published reference metrics came from a different cohort/model task and cannot certify this checkpoint. Local values are reported only when produced on labeled validation/test splits.",
+    }
+    return status
+
+
 def _cached_prediction(image_hash: str) -> dict[str, Any] | None:
     with _cache_lock:
         value = _prediction_cache.get((_model_generation, image_hash))
@@ -376,18 +861,107 @@ def _store_prediction(image_hash: str, result: dict[str, Any]) -> None:
 
 
 def warmup_model() -> bool:
-    """Load model artifacts and execute a dummy call at application startup."""
-    if not MODEL_PATH.is_file() or not LABELS_PATH.is_file():
-        return False
-    model, metadata = _get_model()
-    image_size = metadata["image_size"]
-    dummy = np.zeros((1, image_size[0], image_size[1], 3), dtype=np.float32)
+    """Warm each available model independently; return whether CVM is inference-ready."""
+    cvm_ready = False
+    if MODEL_PATH.is_file() and LABELS_PATH.is_file():
+        model, metadata = _get_model()
+        image_size = metadata["image_size"]
+        dummy = np.zeros((1, image_size[0], image_size[1], 3), dtype=np.float32)
+        with _inference_lock:
+            model(dummy, training=False)
+            roi_model = _get_roi_model(metadata)
+            if roi_model is not None:
+                roi_model(dummy, training=False)
+        cvm_ready = True
+    if DEFAULT_CVA_MODEL_PATH.is_file() and CVA_LABELS_PATH.is_file():
+        cva_model, cva_metadata = _get_cva_model()
+        if cva_model is not None:
+            image_size = (cva_metadata or {}).get("image_size", IMAGE_SIZE)
+            with _inference_lock:
+                cva_model(np.zeros((1, image_size[0], image_size[1], 3), dtype=np.float32), training=False)
+    return cvm_ready
+
+
+def _cva_result_for_pixels(pixels: np.ndarray) -> dict[str, Any]:
+    cva_model, cva_metadata = _get_cva_model()
+    if cva_model is None:
+        return {
+            "cva_status": "not_evaluated", "cva_model_available": False,
+            "cva_probability": None, "cva_label": None,
+            "cva_message": "No trained CVA detector or CVA-annotated training set is configured.",
+        }
+    raw_score = cva_model(pixels, training=False)
+    score = float(np.asarray(raw_score.numpy() if hasattr(raw_score, "numpy") else raw_score).reshape(-1)[0])
+    threshold = float((cva_metadata or {}).get("threshold", 0.5))
+    flagged = score >= threshold
+    return {
+        "cva_status": "potential_cva_flagged" if flagged else "normal_pattern_predicted",
+        "cva_model_available": True,
+        "cva_probability": round(score, 6),
+        "cva_confidence_percent": round(score * 100 if flagged else (1 - score) * 100, 2),
+        "cva_threshold": threshold,
+        "cva_label": "Potential Cervical Vertebral Anomaly Flagged" if flagged else "Normal pattern predicted",
+        "cva_score_calibration": "uncalibrated_sigmoid_score",
+        "cva_message": (
+            "Binary image-level screening only; this model does not localize or distinguish CVA subtypes. "
+            "Review C2-C4 and the atlas manually."
+        ),
+        "cva_anomaly_type_examples_not_individually_detected": (cva_metadata or {}).get("anomaly_type_examples", []),
+        "cva_subtype_detection_supported": False,
+    }
+
+
+def _apply_cva_roi_compatibility(result: dict[str, Any], roi_status: str) -> dict[str, Any]:
+    """Do not emit a CVA prediction if its trained crop input is unavailable."""
+    _, metadata = _get_cva_model()
+    result["cva_roi_status"] = roi_status
+    model_expects_roi = bool(metadata and metadata.get("roi_training_enabled"))
+    inference_has_roi = roi_status == "automatic_c2_c3_c4_roi"
+    if metadata is not None and model_expects_roi != inference_has_roi:
+        result.update({
+            "cva_status": "not_evaluated_roi_mode_mismatch",
+            "cva_label": "Not evaluated: CVA model / ROI mode mismatch",
+            "cva_probability": None,
+            "cva_confidence_percent": None,
+            "cva_message": "CVA training and inference do not use the same C2-C4 crop configuration. Retrain with matching ROI boxes/localizer settings before using this result.",
+        })
+    return result
+
+
+def predict_cva_from_image(image_bytes: bytes) -> dict[str, Any]:
+    """Standalone endpoint hook for CVA-only screening."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            rgb = source.convert("RGB")
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ValueError("Uploaded file is not a readable image.") from exc
+    model, metadata = _get_cva_model()
+    if model is None:
+        return _cva_result_for_pixels(np.zeros((1, *IMAGE_SIZE, 3), dtype=np.float32))
+    roi_status = "full_image_no_localizer"
+    try:
+        _, cvm_metadata = _get_model()
+        roi_model = _get_roi_model(cvm_metadata or {})
+    except (FileNotFoundError, RuntimeError):
+        roi_model = None
+    if roi_model is not None:
+        roi_pixels = np.ascontiguousarray(rgb.resize((IMAGE_SIZE[1], IMAGE_SIZE[0]), Image.Resampling.BILINEAR), dtype=np.float32)[None, ...]
+        with _inference_lock:
+            box_raw = roi_model(roi_pixels, training=False)
+        box = np.asarray(box_raw.numpy() if hasattr(box_raw, "numpy") else box_raw).reshape(-1)
+        if box.size == 4:
+            x0, x1 = sorted((float(box[0]), float(box[2])))
+            y0, y1 = sorted((float(box[1]), float(box[3])))
+            if x1 - x0 >= 0.03 and y1 - y0 >= 0.03:
+                rgb = _crop_normalized(rgb, (x0, y0, x1, y1))
+                roi_status = "automatic_c2_c3_c4_roi"
+            else:
+                roi_status = "full_image_fallback_invalid_roi"
+    image_size = (metadata or {}).get("image_size", list(IMAGE_SIZE))
+    pixels = np.ascontiguousarray(rgb.resize((image_size[1], image_size[0]), Image.Resampling.BILINEAR), dtype=np.float32)[None, ...]
     with _inference_lock:
-        model(dummy, training=False)
-        roi_model = _get_roi_model(metadata)
-        if roi_model is not None:
-            roi_model(dummy, training=False)
-    return True
+        result = _cva_result_for_pixels(pixels)
+    return _apply_cva_roi_compatibility(result, roi_status)
 
 
 def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
@@ -434,6 +1008,8 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
             name: np.asarray(value.numpy() if hasattr(value, "numpy") else value)
             for name, value in raw.items()
         } if isinstance(raw, dict) else {model.output_names[0]: np.asarray(raw.numpy() if hasattr(raw, "numpy") else raw)}
+        cva_result = _cva_result_for_pixels(pixels)
+        cva_result = _apply_cva_roi_compatibility(cva_result, roi_status)
     probabilities = np.asarray(outputs["cvm_stage"])[0]
     index = int(np.argmax(probabilities))
     stage_value = int(metadata["stage_values"][index])
@@ -456,7 +1032,7 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
         "predicted_skeletal_age_years": round(predicted_age, 1) if predicted_age is not None else None,
         "cvm_stage": stage_value,
         "cvm_stage_label": metadata.get("stage_titles", {}).get(str(stage_value), f"CVM-S{stage_value}"),
-        "cva_status": "Not evaluated",
+        **cva_result,
         "cvm_stage_confidence": round(float(probabilities[index]), 4),
         "cvm_stage_top2": top2,
         "confidence_calibration": "uncalibrated_softmax_scores",
@@ -477,16 +1053,29 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train the CLEFTSKEL-AI MobileNetV2 model on Aariz.")
-    parser.add_argument("--train", action="store_true", help="Train and save the model.")
+    parser.add_argument("--train", "--train-cvmi", dest="train", action="store_true", help="Train and save the six-stage CVMI model.")
+    parser.add_argument("--train-cva", action="store_true", help="Train the separate binary CVA detector.")
+    parser.add_argument("--evaluate", action="store_true", help="Evaluate saved checkpoints on validation and held-out test splits.")
     parser.add_argument("--dataset", default=str(DEFAULT_DATASET_DIR), help="Aariz dataset root.")
     parser.add_argument("--output", default=str(MODEL_PATH), help="Output .keras model path.")
     parser.add_argument("--age-labels", help="Optional CSV with cephalogram_id,skeletal_age_years columns.")
     parser.add_argument("--stage-age-map", help="Optional JSON mapping CVM stage numbers to synthetic age targets, e.g. {\"1\": 9.0}.")
     parser.add_argument("--roi-boxes", help="Optional CSV with normalized C2-C4 ROI boxes: cephalogram_id,x_min,y_min,x_max,y_max.")
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--cva-labels", help="CSV with cephalogram_id,cva_present (0=normal, 1=abnormal) columns.")
+    parser.add_argument("--cva-roi-boxes", help="Optional normalized C2-C4 ROI boxes CSV for CVA training.")
+    parser.add_argument("--cva-output", default=str(DEFAULT_CVA_MODEL_PATH), help="Output path for the separate CVA model.")
+    parser.add_argument("--metrics-output", help="Evaluation JSON destination (default: backend/artifacts/evaluation_metrics.json).")
+    parser.add_argument("--epochs", type=int, help="Optional override applied to whichever model is being trained.")
+    parser.add_argument("--cvmi-epochs", type=int, default=100)
+    parser.add_argument("--cva-epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=16)
     args = parser.parse_args()
-    if not args.train:
-        parser.error("Pass --train to begin model training.")
-    age_map = json.loads(Path(args.stage_age_map).read_text(encoding="utf-8")) if args.stage_age_map else None
-    print(json.dumps(train_model(args.dataset, args.output, args.age_labels, age_map, args.epochs, args.batch_size, roi_boxes_csv=args.roi_boxes), indent=2))
+    if args.evaluate:
+        print(json.dumps(evaluate_saved_models(args.dataset, args.output, args.age_labels, args.roi_boxes, args.cva_labels, args.cva_output, args.metrics_output), indent=2))
+    elif args.train_cva:
+        print(json.dumps(train_cva_model(args.dataset, args.cva_labels, args.cva_output, args.epochs or args.cva_epochs, args.batch_size, args.cva_roi_boxes), indent=2))
+    elif args.train:
+        age_map = json.loads(Path(args.stage_age_map).read_text(encoding="utf-8")) if args.stage_age_map else None
+        print(json.dumps(train_cvmi_model(args.dataset, args.output, args.age_labels, age_map, args.epochs or args.cvmi_epochs, args.batch_size, roi_boxes_csv=args.roi_boxes), indent=2))
+    else:
+        parser.error("Pass --train, --train-cva, or --evaluate.")

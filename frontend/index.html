@@ -24,7 +24,7 @@
         </span>
         <span><span class="block text-base font-bold tracking-tight">CLEFTSKEL<span class="text-teal">-AI</span></span><span class="block text-xs text-muted">Cephalometric analysis</span></span>
       </a>
-      <div class="flex items-center gap-2 rounded-full bg-slate-50 px-3 py-2 text-xs font-medium text-muted"><span id="api-dot" class="h-2 w-2 rounded-full bg-amber-400"></span><span id="api-status">Checking API</span></div>
+      <div class="flex flex-col items-start gap-1 rounded-xl bg-slate-50 px-3 py-2 text-xs font-medium text-muted sm:flex-row sm:items-center sm:gap-3"><span class="inline-flex items-center gap-2"><span id="api-dot" class="h-2 w-2 rounded-full bg-amber-400"></span><span id="api-status">Checking API</span></span><span id="model-status" class="border-t border-slate-200 pt-1 sm:border-l sm:border-t-0 sm:pl-3 sm:pt-0">Checking model artifacts</span></div>
     </div>
   </header>
 
@@ -46,6 +46,11 @@
           <label class="text-xs font-semibold text-muted">Patient ID (optional)<input id="patient-id" maxlength="120" autocomplete="off" class="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10" placeholder="Clinic identifier" /></label>
           <label class="text-xs font-semibold text-muted">Age or DOB (optional)<input id="patient-age" maxlength="40" autocomplete="off" class="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10" placeholder="e.g. 14 years or YYYY-MM" /></label>
           <label class="text-xs font-semibold text-muted">Treating orthodontist (optional)<input id="orthodontist" maxlength="120" autocomplete="off" class="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10" placeholder="Clinician name" /></label>
+          <label class="text-xs font-semibold text-muted sm:col-span-2">Patient group
+            <select id="patient-group" class="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm font-normal text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/10">
+              <option value="non_uclp">Non-Cleft</option><option value="uclp">UCLP / Cleft</option>
+            </select>
+          </label>
         </div>
         <input id="file-input" type="file" accept="image/jpeg,image/png,image/webp" class="sr-only" />
         <button id="drop-zone" type="button" class="group flex min-h-64 w-full flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50/70 px-5 text-center transition hover:border-teal/60 hover:bg-teal/[.03] focus:outline-none focus:ring-4 focus:ring-teal/10" aria-label="Choose an X-ray image or drop one here">
@@ -68,12 +73,19 @@
         <div id="preview-wrap" class="hidden overflow-hidden rounded-xl bg-slate-950"><img id="preview" alt="Uploaded lateral cephalogram preview" class="max-h-72 w-full object-contain" /></div>
         <div class="mt-5 grid gap-3 sm:grid-cols-3">
           <div class="rounded-xl border border-slate-100 bg-slate-50/80 p-4"><p class="text-xs font-medium text-muted">Predicted skeletal age</p><p id="age-result" class="mt-2 text-xl font-bold">— <span class="text-sm font-medium text-muted">years</span></p></div>
-          <div class="rounded-xl border border-slate-100 bg-slate-50/80 p-4"><p class="text-xs font-medium text-muted">CVM stage</p><p id="cva-result" class="mt-2 text-base font-bold">Awaiting analysis</p></div>
+          <div class="rounded-xl border border-slate-100 bg-slate-50/80 p-4"><p class="text-xs font-medium text-muted">CVM stage</p><p id="cvm-result" class="mt-2 text-base font-bold">Awaiting analysis</p></div>
           <div class="rounded-xl border border-slate-100 bg-slate-50/80 p-4"><p class="text-xs font-medium text-muted">Top-stage model score</p><p id="confidence-result" class="mt-2 text-base font-bold">—</p></div>
+          <div class="rounded-xl border border-amber-100 bg-amber-50/50 p-4 sm:col-span-3"><p class="text-xs font-medium text-muted">CVA screening</p><p id="cva-result" class="mt-2 text-sm font-bold">Not evaluated</p><p id="cva-score" class="mt-1 text-xs text-muted"></p></div>
         </div>
         <p id="result-status" class="mt-3 text-xs text-muted" role="status" aria-live="polite">Upload an image to get started.</p>
       </section>
     </div>
+
+    <details id="recent-history" class="mt-6 rounded-2xl border border-slate-200 bg-white shadow-card">
+      <summary class="cursor-pointer list-none px-5 py-4 font-semibold"><span class="mr-2 text-teal">▸</span>Recent analyses <span class="ml-2 text-xs font-normal text-muted">Saved locally on this browser · last 5 · no images or identifiers stored</span></summary>
+      <div id="history-list" class="grid gap-3 border-t border-slate-100 p-5 sm:grid-cols-2 lg:grid-cols-3"><p class="text-sm text-muted">No saved analyses yet.</p></div>
+      <div class="border-t border-slate-100 px-5 py-3 text-right"><button id="clear-history" type="button" class="text-xs font-semibold text-rose-700 hover:underline">Clear local history</button></div>
+    </details>
 
     <section id="comprehensive-report" class="mt-10 hidden scroll-mt-8" aria-live="polite" aria-labelledby="report-heading">
       <div class="mb-6 flex items-center gap-4" aria-hidden="true">
@@ -105,7 +117,12 @@
         </div>
 
         <div id="patient-summary" class="mb-5 hidden rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm"></div>
+        <div id="group-summary" class="mb-5 hidden rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm leading-6 text-indigo-950"></div>
         <div id="clinical-review-flag" class="mb-5 hidden rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-950" role="status"></div>
+        <section id="model-validation" class="mb-5 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3" aria-label="Model validation summary">
+          <p class="text-xs font-bold uppercase tracking-wide text-muted">Checkpoint evaluation & published reference</p>
+          <p id="model-validation-summary" class="mt-2 text-sm leading-6 text-ink">Local validation metrics are shown when recorded by the training/evaluation command. Published study benchmarks are references only.</p>
+        </section>
 
         <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
           <article class="rounded-xl border border-teal/15 bg-teal/[.035] p-5 xl:col-span-2">
@@ -119,7 +136,18 @@
             <p id="stage-candidates" class="mt-3 text-sm font-semibold leading-6 text-ink"></p>
             <p class="mt-2 text-xs leading-5 text-muted">Raw model softmax scores; not calibrated clinical probabilities.</p>
           </article>
-          <article class="rounded-xl border border-slate-200 bg-slate-50/70 p-5 xl:col-span-2">
+          <article class="rounded-xl border border-rose-200 bg-rose-50/50 p-5 xl:col-span-2">
+            <p class="text-xs font-bold uppercase tracking-wide text-rose-800">CVA screening · binary result</p>
+            <p id="cva-report" class="mt-3 text-sm font-semibold leading-6 text-ink">Not evaluated</p>
+            <p id="cva-report-note" class="mt-2 text-xs leading-5 text-muted">A subtype or lesion location is not returned.</p>
+          </article>
+          <article class="rounded-xl border border-sky-200 bg-sky-50/50 p-5 xl:col-span-3">
+            <p class="text-xs font-bold uppercase tracking-wide text-sky-900">Cohort comparison context</p>
+            <p id="cohort-comparison" class="mt-3 text-sm leading-6 text-ink"></p>
+            <p id="cohort-evidence-note" class="mt-2 text-xs leading-5 text-muted"></p>
+            <a class="mt-2 inline-block text-xs font-semibold text-teal underline" href="https://doi.org/10.1177/10556656241299890" target="_blank" rel="noopener noreferrer">View cited study abstract</a>
+          </article>
+          <article class="rounded-xl border border-slate-200 bg-slate-50/70 p-5 xl:col-span-3">
             <p class="text-xs font-bold uppercase tracking-wide text-muted">Approximate maturity timeline</p>
             <p id="maturity-timeline" class="mt-3 text-sm leading-6 text-ink"></p>
             <p id="active-growth-duration" class="mt-2 border-t border-slate-200 pt-2 text-xs leading-5 text-muted"></p>
@@ -142,11 +170,6 @@
           </article>
         </div>
 
-    <details id="recent-history" class="mt-6 rounded-2xl border border-slate-200 bg-white shadow-card">
-      <summary class="cursor-pointer list-none px-5 py-4 font-semibold"><span class="mr-2 text-teal">▸</span>Recent analyses <span class="ml-2 text-xs font-normal text-muted">Saved locally on this browser · last 5 · no X-ray images stored</span></summary>
-      <div id="history-list" class="grid gap-3 border-t border-slate-100 p-5 sm:grid-cols-2 lg:grid-cols-3"><p class="text-sm text-muted">No saved analyses yet.</p></div>
-      <div class="border-t border-slate-100 px-5 py-3 text-right"><button id="clear-history" type="button" class="text-xs font-semibold text-rose-700 hover:underline">Clear local history</button></div>
-    </details>
         <div class="mt-5 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3.5 text-sm leading-6 text-amber-950">
           <svg class="mt-0.5 h-5 w-5 shrink-0 text-amber-700" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.72-1.36 3.486 0l6.518 11.59C19.01 16.05 18.04 17.75 16.518 17.75H3.482c-1.522 0-2.492-1.7-1.743-3.061L8.257 3.1zM11 14a1 1 0 10-2 0 1 1 0 002 0zm-1-2a1 1 0 01-1-1V8a1 1 0 112 0v3a1 1 0 01-1 1z" clip-rule="evenodd"/></svg>
           <p><strong>Research decision support only.</strong> This is not an automated treatment order. Validate findings with the treating orthodontist or surgeon using the full clinical record.</p>
@@ -171,11 +194,24 @@
     const HISTORY_KEY = 'cleftskel_recent_analyses_v1';
 
     function currentMetadata() {
-      return { patient_name: document.querySelector('#patient-name').value.trim(), patient_id: document.querySelector('#patient-id').value.trim(), patient_age: document.querySelector('#patient-age').value.trim(), treating_orthodontist: document.querySelector('#orthodontist').value.trim() };
+      return { patient_name: document.querySelector('#patient-name').value.trim(), patient_id: document.querySelector('#patient-id').value.trim(), patient_age: document.querySelector('#patient-age').value.trim(), treating_orthodontist: document.querySelector('#orthodontist').value.trim(), patient_group: document.querySelector('#patient-group').value };
     }
     function appendMetadata(formData) { Object.entries(currentMetadata()).forEach(([key, value]) => { if (value) formData.append(key, value); }); }
+    function renderValidationSummary(summary = {}) {
+      const cvmTest = summary.cvm?.test || {};
+      const cvaTest = summary.cva?.test || {};
+      const published = summary.published_reference || {};
+      const localParts = [];
+      if (cvmTest.overall_accuracy_percent != null) {
+        const stageSix = cvmTest.per_stage_accuracy?.['CVMI-6']?.accuracy_percent;
+        localParts.push(`Local CVM held-out test accuracy ${Number(cvmTest.overall_accuracy_percent).toFixed(2)}% (n=${cvmTest.sample_count}); CVMI-6 recall ${stageSix == null ? 'n/a' : `${Number(stageSix).toFixed(2)}%`}.`);
+      }
+      if (cvaTest.overall_accuracy_percent != null) localParts.push(`Local CVA held-out test accuracy ${Number(cvaTest.overall_accuracy_percent).toFixed(2)}% (n=${cvaTest.sample_count}).`);
+      const reference = published.average_accuracy_percent == null ? 'Published reference metrics unavailable.' : `Published reference (different study/task): ${published.average_accuracy_percent}% average accuracy, up to ${published.skeletal_maturity_accuracy_max_percent}% for skeletal maturity, and ${published.cva_detection_accuracy_percent}% for CVA detection. The 88% result is not specified as CVMI-6.`;
+      document.querySelector('#model-validation-summary').textContent = `${localParts.join(' ') || 'Local validation/test metrics not recorded for the installed checkpoint.'} ${reference} ${summary.comparability_note || 'Reference values do not certify this model.'}`;
+    }
     function metadataMarkup(meta = {}) {
-      const fields = [['Patient', meta.patient_name], ['ID', meta.patient_id], ['Age / DOB', meta.patient_age], ['Orthodontist', meta.treating_orthodontist]].filter(([, value]) => value);
+      const fields = [['Patient', meta.patient_name], ['ID', meta.patient_id], ['Age / DOB', meta.patient_age], ['Orthodontist', meta.treating_orthodontist], ['Group', meta.patient_group_label || (meta.patient_group === 'uclp' ? 'UCLP / Cleft' : 'Non-Cleft')]].filter(([, value]) => value);
       return fields.length ? fields.map(([label, value]) => `<span><strong>${label}:</strong> ${escapeHtml(value)}</span>`).join('<span class="text-slate-300">|</span>') : '<span class="text-muted">No patient metadata supplied</span>';
     }
     function escapeHtml(value) { return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]); }
@@ -197,7 +233,7 @@
     function saveHistory(payload) {
       try {
         // Keep history comparable without persisting identifiers, filenames, or X-ray bytes.
-        const record = { saved_at: new Date().toISOString(), cvm_stage: payload.cvm_stage, cvm_stage_label: payload.cvm_stage_label, cvm_stage_confidence: payload.cvm_stage_confidence, cvm_stage_top2: payload.cvm_stage_top2, predicted_skeletal_age_years: payload.predicted_skeletal_age_years, age_target_source: payload.age_target_source, roi_status: payload.roi_status, clinical_guidance: payload.clinical_guidance };
+        const record = { saved_at: new Date().toISOString(), cvm_stage: payload.cvm_stage, cvm_stage_label: payload.cvm_stage_label, cvm_stage_confidence: payload.cvm_stage_confidence, cvm_stage_top2: payload.cvm_stage_top2, predicted_skeletal_age_years: payload.predicted_skeletal_age_years, age_target_source: payload.age_target_source, roi_status: payload.roi_status, clinical_guidance: payload.clinical_guidance, cva_screening: payload.cva_screening, group_comparison: payload.group_comparison, patient_group: payload.patient_metadata?.patient_group, validation_summary: payload.validation_summary };
         localStorage.setItem(HISTORY_KEY, JSON.stringify([record, ...readHistory().filter(item => item.saved_at !== record.saved_at)].slice(0, 5)));
         renderHistory();
       } catch { showError('Analysis succeeded, but this browser could not save it to local history.'); }
@@ -205,11 +241,23 @@
     function restoreHistory(record) {
       const meta = {};
       for (const [id, key] of [['patient-name','patient_name'],['patient-id','patient_id'],['patient-age','patient_age'],['orthodontist','treating_orthodontist']]) document.querySelector(`#${id}`).value = meta[key] || '';
+      document.querySelector('#patient-group').value = record.patient_group || 'non_uclp';
       document.querySelector('#patient-summary').textContent = 'Saved history omits patient identifiers and image data.'; document.querySelector('#patient-summary').classList.remove('hidden');
       document.querySelector('#age-result').innerHTML = record.predicted_skeletal_age_years == null ? '— <span class="text-sm font-medium text-muted">years</span>' : `${Number(record.predicted_skeletal_age_years).toFixed(1)} <span class="text-sm font-medium text-muted">years</span>`;
-      document.querySelector('#cva-result').textContent = record.cvm_stage_label || 'Stage unavailable';
+      document.querySelector('#cvm-result').textContent = record.cvm_stage_label || 'Stage unavailable';
       document.querySelector('#confidence-result').textContent = record.cvm_stage_confidence == null ? '—' : `${(Number(record.cvm_stage_confidence) * 100).toFixed(1)}%`;
       const guidance = record.clinical_guidance || {};
+      renderValidationSummary(record.validation_summary || {});
+      const cva = record.cva_screening || {};
+      document.querySelector('#cva-result').textContent = cva.cva_label || 'Not evaluated';
+      document.querySelector('#cva-score').textContent = cva.cva_probability == null ? (cva.cva_message || 'No trained CVA detector in saved result.') : `Uncalibrated positive score: ${(Number(cva.cva_probability) * 100).toFixed(1)}%`;
+      const comparison = record.group_comparison || {};
+      document.querySelector('#cohort-comparison').textContent = comparison.project_supplied_delayed_growth_percent == null ? 'No cohort comparison was recorded.' : `${comparison.selected_group_label}: project-supplied delayed-growth figure ${Number(comparison.project_supplied_delayed_growth_percent).toFixed(2)}%; reported demo comparison is ${Number(comparison.project_supplied_group_difference_percentage_points).toFixed(2)} percentage points; project-supplied mean skeletal-age lag ${Number(comparison.project_supplied_mean_skeletal_age_lag_years).toFixed(2)} years.`;
+      document.querySelector('#cohort-evidence-note').textContent = [comparison.published_abstract_summary, comparison.published_abstract_model_metrics?.note].filter(Boolean).join(' ');
+      document.querySelector('#group-summary').textContent = comparison.clinical_note || '';
+      document.querySelector('#group-summary').classList.remove('hidden');
+      document.querySelector('#cva-report').textContent = cva.cva_label || 'Not evaluated';
+      document.querySelector('#cva-report-note').textContent = cva.cva_message || 'Binary screen unavailable.';
       document.querySelector('#growth-phase').textContent = guidance.growth_phase_label || 'Unavailable'; document.querySelector('#growth-summary').textContent = guidance.phase_summary || '';
       document.querySelector('#growth-velocity').textContent = guidance.growth_velocity_descriptor || ''; document.querySelector('#maturity-timeline').textContent = guidance.estimated_time_to_skeletal_maturity || '';
       document.querySelector('#active-growth-duration').textContent = guidance.active_growth_duration_note || ''; document.querySelector('#treatment-decision').textContent = guidance.treat_now_or_defer || '';
@@ -241,7 +289,6 @@
       reportButton.disabled = true;
       printButton.disabled = true;
       document.querySelector('#patient-summary').classList.add('hidden');
-      printButton.disabled = true;
       comprehensiveReport.classList.add('hidden');
       document.querySelector('#file-name').textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
       document.querySelector('#file-name').classList.remove('hidden');
@@ -252,7 +299,10 @@
       document.querySelector('#preview').src = previewUrl;
       analyzeButton.disabled = false;
       document.querySelector('#age-result').innerHTML = '— <span class="text-sm font-medium text-muted">years</span>';
-      document.querySelector('#cva-result').textContent = 'Awaiting analysis';
+      document.querySelector('#cvm-result').textContent = 'Awaiting analysis';
+      document.querySelector('#cva-result').textContent = 'Not evaluated';
+      document.querySelector('#cva-score').textContent = '';
+      document.querySelector('#group-summary').classList.add('hidden');
       document.querySelector('#confidence-result').textContent = '—';
       document.querySelector('#result-status').textContent = 'Image ready for analysis.';
     }
@@ -280,13 +330,28 @@
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.detail || 'The analysis request failed.');
         const patientMetadata = payload.patient_metadata || currentMetadata();
+        renderValidationSummary(payload.validation_summary || {});
         document.querySelector('#patient-summary').innerHTML = metadataMarkup(patientMetadata);
         document.querySelector('#patient-summary').classList.remove('hidden');
         document.querySelector('#age-result').innerHTML = payload.predicted_skeletal_age_years == null
           ? '— <span class="text-sm font-medium text-muted">years</span>'
           : `${Number(payload.predicted_skeletal_age_years).toFixed(1)} <span class="text-sm font-medium text-muted">years</span>`;
-        document.querySelector('#cva-result').textContent = payload.cvm_stage_label || 'No result returned';
+        document.querySelector('#cvm-result').textContent = payload.cvm_stage_label || 'No result returned';
         document.querySelector('#confidence-result').textContent = payload.cvm_stage_confidence == null ? '—' : `${(Number(payload.cvm_stage_confidence) * 100).toFixed(1)}%`;
+        const cva = payload.cva_screening || {};
+        document.querySelector('#cva-result').textContent = cva.cva_label || 'Not evaluated';
+        document.querySelector('#cva-score').textContent = cva.cva_probability == null
+          ? (cva.cva_message || 'No trained CVA detector configured.')
+          : `Uncalibrated positive score: ${(Number(cva.cva_probability) * 100).toFixed(1)}% · threshold ${(Number(cva.cva_threshold || 0.5) * 100).toFixed(0)}%`;
+        document.querySelector('#cva-report').textContent = cva.cva_label || 'Not evaluated';
+        document.querySelector('#cva-report-note').textContent = cva.cva_message || 'Binary screen only; no subtype or location is returned.';
+        const comparison = payload.group_comparison || {};
+        document.querySelector('#group-summary').textContent = comparison.clinical_note || '';
+        document.querySelector('#group-summary').classList.remove('hidden');
+        document.querySelector('#cohort-comparison').textContent = comparison.project_supplied_delayed_growth_percent == null
+          ? 'No cohort comparison is available.'
+          : `${comparison.selected_group_label}: project-supplied delayed-growth figure ${Number(comparison.project_supplied_delayed_growth_percent).toFixed(2)}%; project-supplied group difference ${Number(comparison.project_supplied_group_difference_percentage_points).toFixed(2)} percentage points; mean skeletal-age lag ${Number(comparison.project_supplied_mean_skeletal_age_lag_years).toFixed(2)} years.`;
+        document.querySelector('#cohort-evidence-note').textContent = [comparison.published_abstract_summary, comparison.published_abstract_model_metrics?.note].filter(Boolean).join(' ');
         const guidance = payload.clinical_guidance;
         if (guidance) {
           const top2 = payload.cvm_stage_top2 || guidance.cvm_stage_top2 || [];
@@ -363,8 +428,17 @@
     });
 
     fetch(`${API_BASE}/health`).then(response => response.ok ? response.json() : Promise.reject())
-      .then(() => { document.querySelector('#api-dot').className = 'h-2 w-2 rounded-full bg-emerald-500'; document.querySelector('#api-status').textContent = 'API connected'; })
-      .catch(() => { document.querySelector('#api-dot').className = 'h-2 w-2 rounded-full bg-amber-400'; document.querySelector('#api-status').textContent = 'API offline'; });
+      .then(payload => {
+        document.querySelector('#api-dot').className = 'h-2 w-2 rounded-full bg-emerald-500';
+        document.querySelector('#api-status').textContent = 'API connected';
+        const models = payload.models || {};
+        const cvmReady = models.cvm?.state === 'ready';
+        const cvaReady = models.cva?.state === 'ready';
+        const modelStatus = document.querySelector('#model-status');
+        modelStatus.textContent = cvmReady ? (cvaReady ? 'CVM + CVA models ready' : 'CVM ready · CVA weights unavailable') : 'CVM weights/metadata required';
+        modelStatus.className = `border-t border-slate-200 pt-1 sm:border-l sm:border-t-0 sm:pl-3 sm:pt-0 ${cvmReady && cvaReady ? 'text-emerald-700' : 'text-amber-700'}`;
+      })
+      .catch(() => { document.querySelector('#api-dot').className = 'h-2 w-2 rounded-full bg-amber-400'; document.querySelector('#api-status').textContent = 'API offline'; document.querySelector('#model-status').textContent = 'Model status unavailable'; });
   </script>
 </body>
 </html>

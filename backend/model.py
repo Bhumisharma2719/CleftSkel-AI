@@ -250,15 +250,25 @@ def _tensorflow():
     return tf
 
 
-def build_mobilenetv2_model(stage_values: list[int], train_age_head: bool = False, imagenet_weights: str | None = "imagenet"):
-    """Build MobileNetV2 with a CVM classifier and optional age regressor."""
+def build_mobilenetv2_model(
+    stage_values: list[int], train_age_head: bool = False,
+    imagenet_weights: str | None = "imagenet", fine_tune_layers: int = 35,
+):
+    """Build MobileNetV2 with CVM and optional age heads, fine-tuning its tail."""
     tf = _tensorflow()
     inputs = tf.keras.Input(shape=(*IMAGE_SIZE, 3), name="image")
     x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
     backbone = tf.keras.applications.MobileNetV2(
         input_shape=(*IMAGE_SIZE, 3), include_top=False, weights=imagenet_weights
     )
-    backbone.trainable = False
+    backbone.trainable = True
+    # Keep most ImageNet features fixed and fine-tune only the final feature
+    # blocks. Batch-normalization statistics remain frozen for small datasets.
+    freeze_before = max(0, len(backbone.layers) - max(0, int(fine_tune_layers)))
+    for layer in backbone.layers[:freeze_before]:
+        layer.trainable = False
+    for layer in backbone.layers[freeze_before:]:
+        layer.trainable = not isinstance(layer, tf.keras.layers.BatchNormalization)
     x = backbone(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     x = tf.keras.layers.Dropout(0.25)(x)
@@ -273,7 +283,7 @@ def build_mobilenetv2_model(stage_values: list[int], train_age_head: bool = Fals
     if train_age_head:
         losses["skeletal_age_years"] = "mean_squared_error"
         metrics["skeletal_age_years"] = ["mean_absolute_error"]
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss=losses, metrics=metrics)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss=losses, metrics=metrics)
     return model
 
 
@@ -316,13 +326,14 @@ def _training_image_augmenter():
         rotation_range=15,
         width_shift_range=0.10,
         height_shift_range=0.10,
-        zoom_range=0.10,
+        zoom_range=0.15,
         horizontal_flip=True,
         fill_mode="nearest",
     )
 
 
 def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
+    destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     monitor = "val_loss" if validation_available else "loss"
     return [
@@ -331,10 +342,28 @@ def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
             save_best_only=True, save_weights_only=False, verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor=monitor, mode="min", patience=10, restore_best_weights=True,
+            monitor=monitor, mode="min", patience=20, restore_best_weights=True,
             verbose=1,
         ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor=monitor, mode="min", factor=0.2, patience=5,
+            min_lr=1e-7, cooldown=1, verbose=1,
+        ),
     ]
+
+
+def _balanced_class_weights(labels: list[int]) -> dict[int, float]:
+    """Compute sklearn's balanced weights for zero-based CVM class indices."""
+    try:
+        from sklearn.utils.class_weight import compute_class_weight
+    except ImportError as exc:
+        raise RuntimeError(
+            "scikit-learn is required for balanced CVM class weights. "
+            "Install backend/requirements.txt."
+        ) from exc
+    classes = np.unique(np.asarray(labels, dtype=np.int32))
+    weights = compute_class_weight(class_weight="balanced", classes=classes, y=np.asarray(labels, dtype=np.int32))
+    return {int(class_id): float(weight) for class_id, weight in zip(classes, weights)}
 
 
 def _coerce_cva_label(value: Any) -> int | None:
@@ -520,7 +549,7 @@ def train_cva_model(
     valid_records = records_by_split.get("valid", [])
     test_records = records_by_split.get("test", [])
     model = build_cva_classifier()
-    destination = Path(output_path)
+    destination = Path(output_path).expanduser().resolve()
     callbacks = _checkpoint_callbacks(tf, destination, bool(valid_records))
     model.fit(
         dataset(train_records, True), validation_data=dataset(valid_records, False) if valid_records else None,
@@ -806,6 +835,8 @@ def train_cvmi_model(
         missing_stages = sorted({r["cvm_stage"] for r in age_training_records} - mapped_age_map.keys())
         raise ValueError(f"Stage-to-age mapping is missing CVM stages: {missing_stages}")
     stage_to_index = {value: index for index, value in enumerate(stage_values)}
+    train_stage_indices = [stage_to_index[record["cvm_stage"]] for record in splits["train"]]
+    class_weights = _balanced_class_weights(train_stage_indices)
     roi_training_records = splits["train"] + splits.get("valid", [])
     has_roi_labels = bool(roi_training_records) and all(record["roi_box"] is not None for record in roi_training_records)
 
@@ -854,16 +885,31 @@ def train_cvmi_model(
                             pixels = augmenter.random_transform(pixels)
                 except (OSError, UnidentifiedImageError) as exc:
                     raise ValueError(f"Could not read image {record['image_path']}: {exc}") from exc
-                label = {"cvm_stage": np.int32(stage_to_index[record["cvm_stage"]])}
+                stage_index = stage_to_index[record["cvm_stage"]]
+                label = {"cvm_stage": np.int32(stage_index)}
                 if has_age:
                     target = record["skeletal_age_years"] if has_direct_age else mapped_age_map[record["cvm_stage"]]
                     label["skeletal_age_years"] = np.asarray([target], dtype=np.float32)
-                yield pixels, label
+                if shuffle:
+                    # tf.data streams batches and does not reliably support
+                    # Keras class_weight across multi-output models. Per-example
+                    # sample weights apply the identical balanced weighting.
+                    sample_weight = {"cvm_stage": np.float32(class_weights[stage_index])}
+                    if has_age:
+                        sample_weight["skeletal_age_years"] = np.float32(1.0)
+                    yield pixels, label, sample_weight
+                else:
+                    yield pixels, label
 
         output_signature = (
             tf.TensorSpec(shape=(*image_size, 3), dtype=tf.float32),
             {"cvm_stage": tf.TensorSpec(shape=(), dtype=tf.int32), **({"skeletal_age_years": tf.TensorSpec(shape=(1,), dtype=tf.float32)} if has_age else {})},
         )
+        if shuffle:
+            output_signature = (*output_signature, {
+                "cvm_stage": tf.TensorSpec(shape=(), dtype=tf.float32),
+                **({"skeletal_age_years": tf.TensorSpec(shape=(), dtype=tf.float32)} if has_age else {}),
+            })
         dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
         if shuffle:
             dataset = dataset.shuffle(min(len(records), 1000), reshuffle_each_iteration=True)
@@ -872,9 +918,13 @@ def train_cvmi_model(
     train_ds = make_dataset(splits["train"], shuffle=True)
     valid_ds = make_dataset(splits.get("valid", []), shuffle=False)
     model = build_mobilenetv2_model(stage_values, train_age_head=has_age)
-    destination = Path(output_path)
+    destination = Path(output_path).expanduser().resolve()
     callbacks = _checkpoint_callbacks(tf, destination, valid_ds is not None)
-    model.fit(train_ds, validation_data=valid_ds, epochs=epochs, callbacks=callbacks)
+    model.fit(
+        train_ds, validation_data=valid_ds, epochs=epochs, callbacks=callbacks,
+        # class_weights are encoded as per-example sample weights in the
+        # streaming dataset above, which supports both CVM and age outputs.
+    )
     # Reload the best ModelCheckpoint artifact so metrics and sidecar describe it.
     model = tf.keras.models.load_model(destination)
 
@@ -891,6 +941,8 @@ def train_cvmi_model(
         "has_skeletal_age_head": has_age,
         "age_target_source": age_target_source,
         "stage_age_map": {str(key): value for key, value in mapped_age_map.items()} if has_mapped_age else None,
+        "cvm_class_weights": {str(key): value for key, value in class_weights.items()},
+        "fine_tuning": {"unfrozen_backbone_layers": 35, "optimizer": "Adam", "learning_rate": 1e-4},
         "roi_model_path": roi_destination.name if has_roi_labels else None,
         "roi_training_source": "c2_c3_c4_box_annotations" if has_roi_labels else None,
         "dataset_dir": str(Path(dataset_dir).resolve()),

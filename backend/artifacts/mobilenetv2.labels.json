@@ -19,9 +19,17 @@
     224,
     224
   ],
-  "has_skeletal_age_head": false,
-  "age_target_source": null,
-  "stage_age_map": null,
+  "has_skeletal_age_head": true,
+  "skeletal_age_head_architecture": "parallel_dense_regression",
+  "age_target_source": "synthetic_stage_mapping",
+  "stage_age_map": {
+    "1": 9.0,
+    "2": 10.5,
+    "3": 12.0,
+    "4": 13.5,
+    "5": 15.0,
+    "6": 16.0
+  },
   "cvm_class_weights": {
     "0": 7.538461538461538,
     "1": 2.8,
@@ -29,6 +37,27 @@
     "3": 0.6447368421052632,
     "4": 0.3656716417910448,
     "5": 1.0888888888888888
+  },
+  "cvm_balancing": {
+    "classification_loss": "balanced_sparse_focal_loss",
+    "focal_gamma": 2.0,
+    "focal_alpha": [
+      1.8984449721026386,
+      1.1570061495987114,
+      1.2497094736687568,
+      0.5551980031894457,
+      0.4181213004089648,
+      0.7215201010314825
+    ],
+    "sample_weight_strategy": "normalized_sqrt_balanced_class_weight",
+    "sample_weights": {
+      "0": 3.066300148594797,
+      "1": 1.868754786455731,
+      "2": 2.0184858666546908,
+      "3": 0.8967358784141213,
+      "4": 0.675334510304333,
+      "5": 1.1653733584685408
+    }
   },
   "fine_tuning": {
     "unfrozen_backbone_layers": 35,
@@ -41,10 +70,10 @@
   "evaluation_metrics": {
     "validation": {
       "sample_count": 127,
-      "overall_accuracy_percent": 34.65,
+      "overall_accuracy_percent": 42.52,
       "per_stage_accuracy": {
         "CVMI-1": {
-          "accuracy_percent": 0.0,
+          "accuracy_percent": 25.0,
           "support": 4
         },
         "CVMI-2": {
@@ -52,39 +81,49 @@
           "support": 8
         },
         "CVMI-3": {
-          "accuracy_percent": 0.0,
+          "accuracy_percent": 25.0,
           "support": 8
         },
         "CVMI-4": {
-          "accuracy_percent": 0.0,
+          "accuracy_percent": 46.67,
           "support": 30
         },
         "CVMI-5": {
-          "accuracy_percent": 71.93,
+          "accuracy_percent": 40.35,
           "support": 57
         },
         "CVMI-6": {
-          "accuracy_percent": 0.0,
+          "accuracy_percent": 55.0,
           "support": 20
         }
       },
-      "cohen_kappa": -0.0127,
-      "macro_f1_percent": 11.5,
-      "multiclass_brier_score": 0.81071,
-      "expected_calibration_error_percent": 14.64,
+      "cohen_kappa": 0.2311,
+      "macro_f1_percent": 38.04,
+      "multiclass_brier_score": 0.70298,
+      "expected_calibration_error_percent": 8.2,
       "reliability_note": "Kappa is model/reference-label agreement; ECE and Brier score are uncalibrated probability diagnostics, not clinical reliability certification.",
-      "skeletal_age_regression": null
+      "skeletal_age_regression": {
+        "status": "evaluated",
+        "sample_count": 127,
+        "mae_years": 1.001,
+        "rmse_years": 1.342,
+        "prediction_method": [
+          "regression_head"
+        ],
+        "target_source": "synthetic_stage_mapping",
+        "interpretation": "Proxy-age metrics are synthetic mapping agreement, not skeletal-age clinical accuracy."
+      }
     },
     "test": {
       "sample_count": 126,
-      "overall_accuracy_percent": 34.92,
+      "overall_accuracy_percent": 36.51,
       "per_stage_accuracy": {
         "CVMI-1": {
-          "accuracy_percent": 0.0,
+          "accuracy_percent": 50.0,
           "support": 4
         },
         "CVMI-2": {
-          "accuracy_percent": 25.0,
+          "accuracy_percent": 50.0,
           "support": 4
         },
         "CVMI-3": {
@@ -92,24 +131,34 @@
           "support": 6
         },
         "CVMI-4": {
-          "accuracy_percent": 0.0,
+          "accuracy_percent": 53.12,
           "support": 32
         },
         "CVMI-5": {
-          "accuracy_percent": 72.88,
+          "accuracy_percent": 22.03,
           "support": 59
         },
         "CVMI-6": {
-          "accuracy_percent": 0.0,
+          "accuracy_percent": 57.14,
           "support": 21
         }
       },
-      "cohen_kappa": -0.0127,
-      "macro_f1_percent": 10.29,
-      "multiclass_brier_score": 0.8115,
-      "expected_calibration_error_percent": 14.93,
+      "cohen_kappa": 0.1549,
+      "macro_f1_percent": 36.34,
+      "multiclass_brier_score": 0.69642,
+      "expected_calibration_error_percent": 5.66,
       "reliability_note": "Kappa is model/reference-label agreement; ECE and Brier score are uncalibrated probability diagnostics, not clinical reliability certification.",
-      "skeletal_age_regression": null
+      "skeletal_age_regression": {
+        "status": "evaluated",
+        "sample_count": 126,
+        "mae_years": 0.905,
+        "rmse_years": 1.215,
+        "prediction_method": [
+          "regression_head"
+        ],
+        "target_source": "synthetic_stage_mapping",
+        "interpretation": "Proxy-age metrics are synthetic mapping agreement, not skeletal-age clinical accuracy."
+      }
     }
   },
   "published_benchmarks": {
@@ -119,5 +168,10 @@
     "cva_detection_accuracy_percent": 83.0,
     "cvmi_6_accuracy_percent": null,
     "note": "The abstract reports up to 88% for skeletal maturity, not specifically CVMI-6. These are separate-study reference figures and are not targets achieved by this checkpoint."
-  }
+  },
+  "checkpoint_output_names": [
+    "cvm_stage",
+    "skeletal_age_years"
+  ],
+  "evaluation_age_proxy_map_used": false
 }

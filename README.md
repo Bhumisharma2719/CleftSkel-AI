@@ -7,9 +7,9 @@ CleftSkel-AI is a research prototype for reviewing lateral cephalogram X-rays. I
 ## Current capabilities
 
 - MobileNetV2 transfer-learning classifier for CVMI-1 through CVMI-6.
-- Balanced CVM training weights computed from the training split and applied as per-example weights in the streaming `tf.data` pipeline.
+- Class-balanced sparse focal loss plus normalized per-example weights computed from the training split and applied in the streaming `tf.data` pipeline.
 - Fine-tuning of the final MobileNetV2 layers with Adam (`1e-4`), image augmentation, `ReduceLROnPlateau`, early stopping, and best-checkpoint saving.
-- Optional skeletal-age regression head. It requires direct age labels or an explicitly supplied stage-to-age proxy map.
+- Parallel skeletal-age regression head. Training uses direct age labels when complete labels are supplied; otherwise it uses the checked-in stage-to-age proxy map and marks predictions as synthetic.
 - Top-two CVM scores and Grad-CAM overlay in the prediction response.
 - Optional C2-C4 ROI localizer, trained only when normalized ROI box annotations are supplied.
 - Optional standalone CVA classifier, trained only from explicit CVA labels.
@@ -81,7 +81,7 @@ Each CVM annotation must map to an image with the same `ceph_id` (or annotation 
 
 ## Train the CVM model
 
-The default training configuration uses up to 100 epochs and batch size 16. It computes balanced class weights from the training labels, fine-tunes the final 35 MobileNetV2 layers while keeping batch-normalization layers frozen, augments training images (rotation 15 degrees, horizontal/vertical shifts 0.1, zoom 0.15, horizontal flip), and applies early stopping and learning-rate reduction. The best checkpoint is selected by validation loss when a validation split is available.
+The default training configuration uses up to 100 epochs and batch size 16. It combines class-balanced sparse focal loss with normalized per-example weights from the training split, fine-tunes the final 35 MobileNetV2 layers while keeping batch-normalization layers frozen, augments training images (rotation 15 degrees, horizontal/vertical shifts 0.1, zoom 0.15, horizontal flip), and applies early stopping and learning-rate reduction. When complete observed skeletal-age labels are absent, it trains the secondary age head using the checked-in `stage_age_map.json` synthetic proxy targets. The best checkpoint is selected by validation loss when a validation split is available.
 
 Run from the project root:
 
@@ -89,7 +89,7 @@ Run from the project root:
 python backend\model.py --train --dataset "C:\Users\Bhumi\Desktop\Aariz" --epochs 100 --batch-size 16
 ```
 
-To train the optional age head with the included synthetic stage map:
+To explicitly select an age mapping file (the project-root map is used by default when complete observed ages are absent):
 
 ```powershell
 python backend\model.py --train --dataset "C:\Users\Bhumi\Desktop\Aariz" --stage-age-map ".\stage_age_map.json" --epochs 100 --batch-size 16

@@ -1,8 +1,8 @@
-"""Aariz dataset loader, MobileNetV2 training, and inference for CLEFTSKEL-AI.
+"""Aariz dataset loader, multi-task MobileNetV2 training, and inference.
 
-The Aariz CVM annotation files contain CVM stages, not skeletal age in years.
-Age regression can use direct age labels, or explicitly opted-in mapped stage
-targets. Mapped targets are synthetic proxies and are marked as such in output.
+Aariz supplies CVM stages rather than skeletal ages. Age regression uses direct
+age labels when complete labels are supplied, otherwise the checked-in stage
+map is used as a clearly marked synthetic proxy target.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from PIL import Image, UnidentifiedImageError
 DEFAULT_DATASET_DIR = Path(os.getenv("CLEFTSKEL_DATASET_DIR", r"C:\Users\Bhumi\Desktop\Aariz"))
 MODEL_PATH = Path(os.getenv("CLEFTSKEL_MODEL_PATH", Path(__file__).parent / "artifacts" / "mobilenetv2.keras"))
 LABELS_PATH = MODEL_PATH.with_suffix(".labels.json")
+DEFAULT_STAGE_AGE_MAP_PATH = Path(__file__).resolve().parent.parent / "stage_age_map.json"
 DEFAULT_CVA_MODEL_PATH = Path(os.getenv("CLEFTSKEL_CVA_MODEL_PATH", Path(__file__).parent / "artifacts" / "mobilenetv2_cva.keras"))
 CVA_LABELS_PATH = DEFAULT_CVA_MODEL_PATH.with_suffix(".labels.json")
 ROI_MODEL_PATH = MODEL_PATH.with_name(f"{MODEL_PATH.stem}_roi.keras")
@@ -250,9 +251,41 @@ def _tensorflow():
     return tf
 
 
+def _load_stage_age_map(path: str | Path | None = None) -> dict[int, float]:
+    """Load and validate explicit CVM-stage age proxies from JSON."""
+    mapping_path = Path(path).expanduser() if path else DEFAULT_STAGE_AGE_MAP_PATH
+    if not mapping_path.is_file():
+        return {}
+    try:
+        raw = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping = {int(stage): float(age) for stage, age in raw.items()}
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid stage-to-age JSON mapping at {mapping_path}: {exc}") from exc
+    if set(mapping) != {1, 2, 3, 4, 5, 6} or any(not np.isfinite(age) or age <= 0 for age in mapping.values()):
+        raise ValueError("Stage-age mapping must include positive finite ages for stages 1 through 6.")
+    return mapping
+
+
+def _model_output_dict(model, raw_output: Any) -> dict[str, np.ndarray]:
+    """Normalize Keras dict/list/single outputs using the saved output names."""
+    def as_array(value: Any) -> np.ndarray:
+        return np.asarray(value.numpy() if hasattr(value, "numpy") else value)
+
+    if isinstance(raw_output, dict):
+        return {str(name): as_array(value) for name, value in raw_output.items()}
+    names = list(getattr(model, "output_names", []) or [])
+    if isinstance(raw_output, (tuple, list)):
+        if len(names) != len(raw_output):
+            raise ValueError(f"Model returned {len(raw_output)} outputs but declares {len(names)} output names.")
+        return {name: as_array(value) for name, value in zip(names, raw_output)}
+    name = names[0] if names else "cvm_stage"
+    return {name: as_array(raw_output)}
+
+
 def build_mobilenetv2_model(
-    stage_values: list[int], train_age_head: bool = False,
+    stage_values: list[int], train_age_head: bool = True,
     imagenet_weights: str | None = "imagenet", fine_tune_layers: int = 35,
+    focal_alpha: list[float] | None = None, focal_gamma: float = 2.0,
 ):
     """Build MobileNetV2 with CVM and optional age heads, fine-tuning its tail."""
     tf = _tensorflow()
@@ -278,7 +311,24 @@ def build_mobilenetv2_model(
     if train_age_head:
         outputs["skeletal_age_years"] = tf.keras.layers.Dense(1, name="skeletal_age_years")(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    losses: dict[str, Any] = {"cvm_stage": "sparse_categorical_crossentropy"}
+    alpha_values = focal_alpha or [1.0] * len(stage_values)
+    if len(alpha_values) != len(stage_values):
+        raise ValueError("focal_alpha must contain one weight for each CVM stage.")
+    alpha_tensor = tf.constant(alpha_values, dtype=tf.float32)
+
+    # Return one loss per example so tf.data sample weights can be applied by
+    # Keras. Alpha corrects class prevalence; the focal term emphasizes hard
+    # examples. All behavior is captured in the trained checkpoint's graph.
+    def balanced_sparse_focal_loss(y_true, y_pred):
+        labels = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        probs = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        rows = tf.range(tf.shape(labels)[0], dtype=tf.int32)
+        true_class_prob = tf.gather_nd(probs, tf.stack([rows, labels], axis=1))
+        alpha = tf.gather(alpha_tensor, labels)
+        return -alpha * tf.pow(1.0 - true_class_prob, focal_gamma) * tf.math.log(true_class_prob)
+
+    balanced_sparse_focal_loss.__name__ = "balanced_sparse_focal_loss"
+    losses: dict[str, Any] = {"cvm_stage": balanced_sparse_focal_loss}
     metrics: dict[str, Any] = {"cvm_stage": ["accuracy"]}
     if train_age_head:
         losses["skeletal_age_years"] = "mean_squared_error"
@@ -364,6 +414,17 @@ def _balanced_class_weights(labels: list[int]) -> dict[int, float]:
     classes = np.unique(np.asarray(labels, dtype=np.int32))
     weights = compute_class_weight(class_weight="balanced", classes=classes, y=np.asarray(labels, dtype=np.int32))
     return {int(class_id): float(weight) for class_id, weight in zip(classes, weights)}
+
+
+def _focal_and_sample_weights(class_weights: dict[int, float], labels: list[int]) -> tuple[list[float], dict[int, float]]:
+    """Split balanced emphasis between focal alpha and mild per-example weights."""
+    class_ids = sorted(class_weights)
+    root_weights = {class_id: float(np.sqrt(class_weights[class_id])) for class_id in class_ids}
+    alpha_mean = float(np.mean(list(root_weights.values()))) or 1.0
+    focal_alpha = [root_weights[class_id] / alpha_mean for class_id in class_ids]
+    population_mean = float(np.mean([root_weights[int(label)] for label in labels])) or 1.0
+    sample_weights = {class_id: root_weights[class_id] / population_mean for class_id in class_ids}
+    return focal_alpha, sample_weights
 
 
 def _coerce_cva_label(value: Any) -> int | None:
@@ -656,6 +717,7 @@ def _evaluate_cvm_records(
     probabilities: list[np.ndarray] = []
     true_ages: list[float] = []
     predicted_ages: list[float] = []
+    age_prediction_methods: set[str] = set()
     index_by_stage = {stage: index for index, stage in enumerate(stage_values)}
     for record in records:
         with Image.open(record["image_path"]) as source:
@@ -666,25 +728,53 @@ def _evaluate_cvm_records(
                 image = _crop_normalized(image, record["roi_box"])
             pixels = np.ascontiguousarray(image.resize((image_size[1], image_size[0]), Image.Resampling.BILINEAR), dtype=np.float32)[None, ...]
         raw = model(pixels, training=False)
-        outputs = {name: np.asarray(value.numpy() if hasattr(value, "numpy") else value) for name, value in raw.items()} if isinstance(raw, dict) else {model.output_names[0]: np.asarray(raw.numpy() if hasattr(raw, "numpy") else raw)}
+        outputs = _model_output_dict(model, raw)
         y_true.append(index_by_stage[record["cvm_stage"]])
-        probabilities.append(np.asarray(outputs["cvm_stage"])[0])
-        if outputs.get("skeletal_age_years") is not None:
-            target = record.get("skeletal_age_years")
-            if target is None and stage_age_map:
-                target = stage_age_map.get(str(record["cvm_stage"]))
-            if target is not None:
-                true_ages.append(float(target))
-                predicted_ages.append(float(np.asarray(outputs["skeletal_age_years"]).reshape(-1)[0]))
+        stage_probabilities = np.asarray(outputs["cvm_stage"])[0]
+        probabilities.append(stage_probabilities)
+        predicted_stage = int(stage_values[int(np.argmax(stage_probabilities))])
+        target = record.get("skeletal_age_years")
+        if target is None and stage_age_map:
+            target = stage_age_map.get(str(record["cvm_stage"]))
+        age_output = outputs.get("skeletal_age_years")
+        if age_output is not None:
+            predicted_age = float(np.asarray(age_output).reshape(-1)[0])
+            age_prediction_methods.add("regression_head")
+        elif stage_age_map and stage_age_map.get(str(predicted_stage)) is not None:
+            # Legacy checkpoints without the regression branch remain
+            # evaluable, but this is a CVM-to-age proxy, not a regressor.
+            predicted_age = float(stage_age_map[str(predicted_stage)])
+            age_prediction_methods.add("stage_mapping_fallback_from_predicted_cvm")
+        else:
+            predicted_age = None
+        if target is not None and predicted_age is not None:
+            true_ages.append(float(target))
+            predicted_ages.append(predicted_age)
     class_metrics = _classification_summary(y_true, np.asarray(probabilities), stage_values, stage_titles) if records else _classification_summary([], np.empty((0, len(stage_values))), stage_values, stage_titles)
-    age_metrics = None
+    age_metrics: dict[str, Any] = {
+        "status": "not_available",
+        "sample_count": 0,
+        "mae_years": None,
+        "rmse_years": None,
+        "prediction_method": None,
+        "target_source": age_target_source,
+        "interpretation": "Train the regression head with observed age labels or an explicit stage-age mapping to report age metrics.",
+    }
     if true_ages:
         errors = np.asarray(predicted_ages) - np.asarray(true_ages)
         age_metrics = {
+            "status": "evaluated",
             "sample_count": len(true_ages), "mae_years": round(float(np.mean(np.abs(errors))), 3),
             "rmse_years": round(float(np.sqrt(np.mean(errors ** 2))), 3),
-            "target_source": age_target_source,
-            "interpretation": "Proxy-age metrics are synthetic mapping agreement, not skeletal-age clinical accuracy." if age_target_source == "synthetic_stage_mapping" else "Age-head error against supplied age labels; clinical validity requires external validation.",
+            "prediction_method": sorted(age_prediction_methods),
+            "target_source": age_target_source or ("synthetic_stage_mapping" if stage_age_map else "observed_labels"),
+            "interpretation": (
+                "Stage-mapping fallback metrics measure agreement with a synthetic stage proxy; they do not evaluate a regression head or clinical skeletal age."
+                if "stage_mapping_fallback_from_predicted_cvm" in age_prediction_methods
+                else "Proxy-age metrics are synthetic mapping agreement, not skeletal-age clinical accuracy."
+                if age_target_source == "synthetic_stage_mapping"
+                else "Age-head error against supplied age labels; clinical validity requires external validation."
+            ),
         }
     class_metrics["skeletal_age_regression"] = age_metrics
     return class_metrics
@@ -750,14 +840,25 @@ def evaluate_saved_models(
         raise FileNotFoundError(f"CVM checkpoint and sidecar are required: {cvm_path} / {cvm_labels}")
     splits = load_aariz_dataset(dataset_dir, age_labels_csv, roi_boxes_csv)
     metadata = json.loads(cvm_labels.read_text(encoding="utf-8"))
-    cvm_model = _tensorflow().keras.models.load_model(cvm_path)
+    cvm_model = _tensorflow().keras.models.load_model(cvm_path, compile=False)
+    has_age_output = "skeletal_age_years" in (getattr(cvm_model, "output_names", []) or [])
     stages = [int(value) for value in metadata["stage_values"]]
     class_titles = metadata.get("stage_titles", {})
     use_roi = bool(metadata.get("roi_training_source"))
+    evaluation_age_map = metadata.get("stage_age_map")
+    if not has_age_output and not evaluation_age_map:
+        fallback_age_map = _load_stage_age_map()
+        evaluation_age_map = {str(key): value for key, value in fallback_age_map.items()} or None
+    evaluation_age_source = metadata.get("age_target_source")
+    if not has_age_output and evaluation_age_map:
+        evaluation_age_source = "legacy_checkpoint_stage_mapping_fallback"
+    metadata["has_skeletal_age_head"] = has_age_output
+    metadata["checkpoint_output_names"] = list(getattr(cvm_model, "output_names", []) or [])
     evaluation = {
-        "validation": _evaluate_cvm_records(cvm_model, splits.get("valid", []), stages, class_titles, tuple(metadata.get("image_size", IMAGE_SIZE)), use_roi, metadata.get("age_target_source"), metadata.get("stage_age_map")),
-        "test": _evaluate_cvm_records(cvm_model, splits.get("test", []), stages, class_titles, tuple(metadata.get("image_size", IMAGE_SIZE)), use_roi, metadata.get("age_target_source"), metadata.get("stage_age_map")),
+        "validation": _evaluate_cvm_records(cvm_model, splits.get("valid", []), stages, class_titles, tuple(metadata.get("image_size", IMAGE_SIZE)), use_roi, evaluation_age_source, evaluation_age_map),
+        "test": _evaluate_cvm_records(cvm_model, splits.get("test", []), stages, class_titles, tuple(metadata.get("image_size", IMAGE_SIZE)), use_roi, evaluation_age_source, evaluation_age_map),
     }
+    metadata["evaluation_age_proxy_map_used"] = bool(evaluation_age_map and not has_age_output)
     metadata["evaluation_metrics"] = evaluation
     metadata["published_benchmarks"] = PUBLISHED_BENCHMARKS
     cvm_labels.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -821,8 +922,22 @@ def train_cvmi_model(
     age_training_records = splits["train"] + splits.get("valid", [])
     has_direct_age = bool(age_training_records) and all(r["skeletal_age_years"] is not None for r in age_training_records)
     mapped_age_map = {int(key): float(value) for key, value in (stage_age_map or {}).items()}
+    if not has_direct_age and not mapped_age_map:
+        # Aariz supplies CVM stages only. Use the checked-in proxy map so a
+        # standard training run still builds the requested regression branch.
+        mapped_age_map = _load_stage_age_map()
+        if mapped_age_map:
+            logger.warning(
+                "No complete observed-age labels found; training skeletal_age_years with the project stage-age proxy map at %s.",
+                DEFAULT_STAGE_AGE_MAP_PATH,
+            )
     has_mapped_age = bool(mapped_age_map) and all(r["cvm_stage"] in mapped_age_map for r in age_training_records)
     has_age = has_direct_age or has_mapped_age
+    if not has_age:
+        raise ValueError(
+            "CVM training requires a skeletal-age target source to build the regression head. "
+            f"Provide complete age labels or a complete stage-age map (default: {DEFAULT_STAGE_AGE_MAP_PATH})."
+        )
     age_target_source = "observed_labels" if has_direct_age else ("synthetic_stage_mapping" if has_mapped_age else None)
     if has_age:
         age_values = [
@@ -837,6 +952,7 @@ def train_cvmi_model(
     stage_to_index = {value: index for index, value in enumerate(stage_values)}
     train_stage_indices = [stage_to_index[record["cvm_stage"]] for record in splits["train"]]
     class_weights = _balanced_class_weights(train_stage_indices)
+    focal_alpha, balanced_sample_weights = _focal_and_sample_weights(class_weights, train_stage_indices)
     roi_training_records = splits["train"] + splits.get("valid", [])
     has_roi_labels = bool(roi_training_records) and all(record["roi_box"] is not None for record in roi_training_records)
 
@@ -894,7 +1010,7 @@ def train_cvmi_model(
                     # tf.data streams batches and does not reliably support
                     # Keras class_weight across multi-output models. Per-example
                     # sample weights apply the identical balanced weighting.
-                    sample_weight = {"cvm_stage": np.float32(class_weights[stage_index])}
+                    sample_weight = {"cvm_stage": np.float32(balanced_sample_weights[stage_index])}
                     if has_age:
                         sample_weight["skeletal_age_years"] = np.float32(1.0)
                     yield pixels, label, sample_weight
@@ -917,7 +1033,9 @@ def train_cvmi_model(
 
     train_ds = make_dataset(splits["train"], shuffle=True)
     valid_ds = make_dataset(splits.get("valid", []), shuffle=False)
-    model = build_mobilenetv2_model(stage_values, train_age_head=has_age)
+    model = build_mobilenetv2_model(
+        stage_values, train_age_head=has_age, focal_alpha=focal_alpha, focal_gamma=2.0
+    )
     destination = Path(output_path).expanduser().resolve()
     callbacks = _checkpoint_callbacks(tf, destination, valid_ds is not None)
     model.fit(
@@ -926,7 +1044,7 @@ def train_cvmi_model(
         # streaming dataset above, which supports both CVM and age outputs.
     )
     # Reload the best ModelCheckpoint artifact so metrics and sidecar describe it.
-    model = tf.keras.models.load_model(destination)
+    model = tf.keras.models.load_model(destination, compile=False)
 
     stage_titles = {str(stage): f"CVMI-{stage}" for stage in stage_values}
     age_map_for_eval = {str(key): value for key, value in mapped_age_map.items()} if has_mapped_age else None
@@ -939,9 +1057,17 @@ def train_cvmi_model(
         "stage_titles": stage_titles,
         "image_size": list(image_size),
         "has_skeletal_age_head": has_age,
+        "skeletal_age_head_architecture": "parallel_dense_regression" if has_age else None,
         "age_target_source": age_target_source,
         "stage_age_map": {str(key): value for key, value in mapped_age_map.items()} if has_mapped_age else None,
         "cvm_class_weights": {str(key): value for key, value in class_weights.items()},
+        "cvm_balancing": {
+            "classification_loss": "balanced_sparse_focal_loss",
+            "focal_gamma": 2.0,
+            "focal_alpha": focal_alpha,
+            "sample_weight_strategy": "normalized_sqrt_balanced_class_weight",
+            "sample_weights": {str(key): value for key, value in balanced_sample_weights.items()},
+        },
         "fine_tuning": {"unfrozen_backbone_layers": 35, "optimizer": "Adam", "learning_rate": 1e-4},
         "roi_model_path": roi_destination.name if has_roi_labels else None,
         "roi_training_source": "c2_c3_c4_box_annotations" if has_roi_labels else None,
@@ -980,7 +1106,9 @@ def _get_model():
         if not MODEL_PATH.is_file():
             raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Train it with `python backend/model.py --train`.")
         tf = _tensorflow()
-        loaded_model = tf.keras.models.load_model(MODEL_PATH)
+        # Inference does not need a compiled optimizer/loss. compile=False also
+        # supports checkpoints saved with the training-time focal-loss closure.
+        loaded_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
         if not LABELS_PATH.is_file():
             raise FileNotFoundError(f"Model metadata not found at {LABELS_PATH}.")
         loaded_metadata = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
@@ -1253,10 +1381,7 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
         classifier_image = image.resize((width, height), Image.Resampling.BILINEAR)
         pixels = np.ascontiguousarray(classifier_image, dtype=np.float32)[None, ...]
         raw = model(pixels, training=False)
-        outputs = {
-            name: np.asarray(value.numpy() if hasattr(value, "numpy") else value)
-            for name, value in raw.items()
-        } if isinstance(raw, dict) else {model.output_names[0]: np.asarray(raw.numpy() if hasattr(raw, "numpy") else raw)}
+        outputs = _model_output_dict(model, raw)
         cva_result = _cva_result_for_pixels(pixels, classifier_image)
         cva_result = _apply_cva_roi_compatibility(cva_result, roi_status)
     probabilities = np.asarray(outputs["cvm_stage"])[0]
@@ -1276,7 +1401,28 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
         for candidate_index in top_indices
     ]
     age_output = outputs.get("skeletal_age_years")
+    age_prediction_method = "regression_head" if age_output is not None else None
     predicted_age = float(np.asarray(age_output).reshape(-1)[0]) if age_output is not None else None
+    if predicted_age is not None and not np.isfinite(predicted_age):
+        logger.warning("Age regression head returned a non-finite value; using stage-map fallback if available.")
+        predicted_age = None
+        age_prediction_method = None
+    age_map = metadata.get("stage_age_map")
+    if not age_map:
+        try:
+            default_map = _load_stage_age_map()
+            age_map = {str(key): value for key, value in default_map.items()}
+        except ValueError as exc:
+            logger.warning("Could not load default stage-age proxy map: %s", exc)
+            age_map = None
+    if predicted_age is None and age_map:
+        proxy_age = age_map.get(str(stage_value))
+        if proxy_age is not None and np.isfinite(float(proxy_age)):
+            predicted_age = float(proxy_age)
+            age_prediction_method = "stage_mapping_fallback_from_predicted_cvm"
+    effective_age_target_source = metadata.get("age_target_source")
+    if age_prediction_method == "stage_mapping_fallback_from_predicted_cvm":
+        effective_age_target_source = "synthetic_stage_mapping"
     try:
         with _inference_lock:
             explainability = _generate_gradcam_overlay(model, pixels, classifier_image, index)
@@ -1303,12 +1449,21 @@ def predict_from_image(image_bytes: bytes) -> dict[str, Any]:
         "confidence_calibration": "uncalibrated_softmax_scores",
         "roi_status": roi_status,
         "xai_gradcam": explainability,
-        "age_target_source": metadata.get("age_target_source"),
+        "age_target_source": effective_age_target_source,
+        "skeletal_age_prediction_method": age_prediction_method,
+        "skeletal_age_is_proxy": bool(
+            effective_age_target_source == "synthetic_stage_mapping"
+            or age_prediction_method == "stage_mapping_fallback_from_predicted_cvm"
+        ),
         "status": "complete" if predicted_age is not None else "age_labels_required",
         "message": (
-            "Age head trained on synthetic ages mapped from CVM stages; this is not an observed or clinically validated age prediction."
-            if metadata.get("age_target_source") == "synthetic_stage_mapping"
-            else ("" if predicted_age is not None else "CVM stage predicted. Age-in-years labels or an explicit stage-age mapping are required to train the regression head.")
+            "This age was predicted by a regression head trained on synthetic stage-mapped proxy targets; it is not an observed or clinically validated age."
+            if effective_age_target_source == "synthetic_stage_mapping" and age_prediction_method == "regression_head"
+            else "Legacy checkpoint has no regression head; this value is the configured age proxy for its predicted CVM stage, not a learned age estimate."
+            if age_prediction_method == "stage_mapping_fallback_from_predicted_cvm"
+            else "Age head output is based on observed age labels; independent clinical validation is still required."
+            if age_prediction_method == "regression_head"
+            else "CVM stage predicted. No age head or valid stage-age mapping is available."
         ),
     }
     _store_prediction(image_hash, result)
@@ -1325,7 +1480,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default=str(DEFAULT_DATASET_DIR), help="Aariz dataset root.")
     parser.add_argument("--output", default=str(MODEL_PATH), help="Output .keras model path.")
     parser.add_argument("--age-labels", help="Optional CSV with cephalogram_id,skeletal_age_years columns.")
-    parser.add_argument("--stage-age-map", help="Optional JSON mapping CVM stage numbers to synthetic age targets, e.g. {\"1\": 9.0}.")
+    parser.add_argument("--stage-age-map", help="JSON mapping stages to synthetic age targets; defaults to project-root stage_age_map.json when observed age labels are unavailable.")
     parser.add_argument("--roi-boxes", help="Optional CSV with normalized C2-C4 ROI boxes: cephalogram_id,x_min,y_min,x_max,y_max.")
     parser.add_argument("--cva-labels", help="CSV with cephalogram_id,cva_present (0=normal, 1=abnormal) columns.")
     parser.add_argument("--cva-roi-boxes", help="Optional normalized C2-C4 ROI boxes CSV for CVA training.")

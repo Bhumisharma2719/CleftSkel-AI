@@ -188,6 +188,14 @@ python backend\create_architecture_diagram.py
 
 This writes `backend/artifacts/architecture.png` at 300 DPI. If Matplotlib is not installed in the active environment, install it with `python -m pip install matplotlib`.
 
+## Generate the data-distribution figure
+
+```powershell
+python backend\distribution_png.py --dataset "C:\Users\Bhumi\Desktop\Aariz"
+```
+
+This regenerates `distribution_polished.png` from the matched image/annotation records in the train, validation, and test splits. It also plots the scikit-learn class weights calculated from the training split, so the displayed counts and weights stay aligned with the current dataset.
+
 ## Limitations and privacy
 
 The current Aariz annotations provide CVM stages. They do not provide observed skeletal age or CVA ground truth. Stage-mapped ages are synthetic proxies; CVA output remains unavailable until explicit labels and a trained checkpoint are provided. Grad-CAM is a coarse visualization and does not establish causal reasoning or anatomically faithful attention. Growth guidance is qualitative and must not independently determine treatment timing.

@@ -118,7 +118,7 @@ python backend\model.py --train --roi-boxes ".\c2_c3_c4_boxes.csv" --epochs 100 
 
 Without complete ROI labels, the CVM model uses the full image. Verify box quality and localization behavior before interpreting any ROI-based results.
 
-### Optional CVA classifier
+### Optional CVA Classifier
 
 CVA training requires explicit binary annotations; CVM stages or arbitrary filenames are not valid CVA labels. Provide a CSV with `cephalogram_id,cva_present` where `cva_present` is 0 (normal) or 1 (anomaly present):
 

@@ -4,7 +4,7 @@ CleftSkel-AI is a research prototype for reviewing lateral cephalogram X-rays. I
 
 > **Research use only.** This project is not a validated medical device. Outputs require review by a qualified clinician and must not be used alone to diagnose a patient or select, defer, or plan treatment.
 
-## Current Capabilities of Model
+## Current Capabilities
 
 - MobileNetV2 transfer-learning classifier for CVMI-1 through CVMI-6.
 - Class-balanced sparse focal loss plus normalized per-example weights computed from the training split and applied in the streaming `tf.data` pipeline.

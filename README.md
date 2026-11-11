@@ -111,7 +111,6 @@ The dataset does not provide C2-C4 bounding boxes in the expected normalized for
 cephalogram_id,x_min,y_min,x_max,y_max
 sample_image_id,0.30,0.55,0.58,0.88
 ```
-
 ```powershell
 python backend\model.py --train --roi-boxes ".\c2_c3_c4_boxes.csv" --epochs 100 --batch-size 16
 ```

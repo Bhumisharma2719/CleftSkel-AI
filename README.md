@@ -81,7 +81,7 @@ Each CVM annotation must map to an image with the same `ceph_id` (or annotation 
 
 ## Train the CVM model
 
-The default training configuration uses up to 100 epochs and batch size 16. It combines class-balanced sparse focal loss with normalized per-example weights from the training split, fine-tunes the final 35 MobileNetV2 layers while keeping batch-normalization layers frozen, augments training images (rotation 15 degrees, horizontal/vertical shifts 0.1, zoom 0.15, horizontal flip), and applies early stopping and learning-rate reduction. When complete observed skeletal-age labels are absent, it trains the secondary age head using the checked-in `stage_age_map.json` synthetic proxy targets. The best checkpoint is selected by validation loss when a validation split is available.
+The default training configuration runs a frozen-backbone head warm-up, then selects the final 30 MobileNetV2 layers for fine-tuning while keeping batch-normalization layers frozen. The second phase uses Adam with a `1e-5` cosine-decay schedule. CVM classification combines balanced sparse focal loss (gamma 1.5) with capped, softened per-example weights to limit majority-class suppression. General augmentation uses rotation 18 degrees, shifts 0.12, zoom 0.20, horizontal flip, and contrast 0.88-1.12; CVMI-3 receives a wider rotation/shift/zoom/contrast range. Early stopping patience is 20 epochs; the best checkpoint is selected by validation loss when a validation split is available. When complete observed skeletal-age labels are absent, training uses the checked-in `stage_age_map.json` synthetic proxy targets for the secondary age head. The run uses up to 100 epochs and batch size 16.
 
 Run from the project root:
 

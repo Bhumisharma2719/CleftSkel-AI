@@ -79,9 +79,9 @@ def main() -> None:
     )
     weight_ax.bar_label(weights_bars, labels=[f"{value:.2f}" for value in plotted_weights], padding=3, fontsize=8)
     weight_ax.axhline(1.0, color="#C18A35", linewidth=1.2, linestyle="--", label="Neutral weight = 1")
-    weight_ax.set_title("Balanced training class weights", fontsize=12, weight="bold", color="#18324B", pad=12)
+    weight_ax.set_title("Raw balanced class weights", fontsize=12, weight="bold", color="#18324B", pad=12)
     weight_ax.set_xlabel("Cervical vertebral maturation stage", fontsize=9.5, labelpad=8)
-    weight_ax.set_ylabel("Scikit-learn balanced weight", fontsize=9.5, labelpad=8)
+    weight_ax.set_ylabel("Scikit-learn source weight", fontsize=9.5, labelpad=8)
     weight_ax.tick_params(axis="both", labelsize=8.3)
     weight_ax.grid(axis="y", linestyle="--", alpha=0.3)
     weight_ax.set_axisbelow(True)
@@ -90,7 +90,7 @@ def main() -> None:
     fig.suptitle("Aariz CVM Training Distribution and Imbalance Weights", fontsize=15, weight="bold", color="#18324B", y=0.99)
     fig.text(
         0.5, 0.015,
-        "Counts use matched image-annotation records. Class weights are computed on the training split; focal alpha and per-example weights are derived from them.",
+        "Counts use matched records. Source weights are computed on train; capped fourth-root factors derive focal alpha and sample weights.",
         ha="center", va="bottom", fontsize=7.5, color="#516A80",
     )
     fig.tight_layout(rect=(0.02, 0.055, 0.98, 0.94), w_pad=2.6)

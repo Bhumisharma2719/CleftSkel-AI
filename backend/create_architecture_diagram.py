@@ -62,25 +62,25 @@ def main():
             ha="center", va="top", fontsize=10, color=SLATE)
 
     # Sequential image processing and shared feature extraction.
-    add_box(ax, (0.5, 0.855), (0.66, 0.105),
+    add_box(ax, (0.5, 0.87), (0.66, 0.105),
             "Input: Lateral Cephalogram X-ray",
             "Native resolution varies by source image",
             face=BLUE)
-    add_box(ax, (0.5, 0.715), (0.78, 0.125),
+    add_box(ax, (0.5, 0.715), (0.80, 0.155),
             "Preprocessing and Training Augmentation",
-            "Resize: 224 x 224 RGB; MobileNetV2 preprocessing\nRotation: +/-15 degrees; shifts: 0.10; zoom: 0.15; horizontal flip",
+            "Resize: 224 x 224 RGB; MobileNetV2 preprocessing\nGeneral: +/-18 deg; shifts 0.12; zoom 0.20; contrast 0.88-1.12\nCVMI-3: +/-20 deg; shifts 0.15; zoom 0.22; contrast 0.78-1.22",
             face=PALE)
     add_box(ax, (0.5, 0.535), (0.78, 0.13),
             "MobileNetV2 Shared Feature Extractor",
-            "ImageNet initialization; final 35 layers fine-tuned; batch normalization frozen\nAdam learning rate: 1e-4; batch size: 16; maximum: 100 epochs",
+            "Phase 1: frozen-backbone warm-up; 10 epochs at Adam 1e-3\nPhase 2: top 30 layers selected; batch normalization frozen\nAdam 1e-5 with CosineDecay; batch size 16; maximum 100 epochs",
             face=BLUE)
-    add_arrow(ax, (0.5, 0.80), (0.5, 0.78))
-    add_arrow(ax, (0.5, 0.65), (0.5, 0.60))
+    add_arrow(ax, (0.5, 0.8175), (0.5, 0.7925))
+    add_arrow(ax, (0.5, 0.6375), (0.5, 0.60))
 
     # Parallel task outputs.
     add_box(ax, (0.275, 0.345), (0.42, 0.15),
             "Branch A: CVM Classification",
-            "6-class softmax: CVMI-1 through CVMI-6\nBalanced sparse focal loss (gamma=2)\nBalanced per-example training weights",
+            "6-class softmax: CVMI-1 through CVMI-6\nBalanced sparse focal loss (gamma=1.5)\nCapped class alpha and softened sample weights",
             face=TEAL, edge="#3E8B83", title_size=11.5)
     add_box(ax, (0.725, 0.345), (0.42, 0.15),
             "Branch B: Skeletal-Age Regression",
@@ -105,8 +105,8 @@ def main():
 
     ax.text(
         0.5, 0.065,
-        "Callbacks: best validation-loss checkpoint; early stopping patience 20; "
-        "ReduceLROnPlateau factor 0.2, patience 5, minimum learning rate 1e-7, cooldown 1.",
+        "Best validation-loss checkpoint; early stopping patience 20; "
+        "warm-up ReduceLROnPlateau factor 0.2, patience 5; cosine decay during fine-tuning.",
         ha="center", va="center", fontsize=8.2, color=SLATE,
     )
     ax.text(0.5, 0.028,

@@ -40,29 +40,79 @@
   },
   "cvm_balancing": {
     "classification_loss": "balanced_sparse_focal_loss",
-    "focal_gamma": 2.0,
+    "focal_gamma": 1.5,
     "focal_alpha": [
-      1.8984449721026386,
-      1.1570061495987114,
-      1.2497094736687568,
-      0.5551980031894457,
-      0.4181213004089648,
-      0.7215201010314825
+      1.207953361178351,
+      1.1574597721777173,
+      1.2029362249829167,
+      0.8017925563243663,
+      0.7158242140316154,
+      0.914033871305033
     ],
-    "sample_weight_strategy": "normalized_sqrt_balanced_class_weight",
+    "sample_weight_strategy": "capped_normalized_fourth_root_class_weight",
     "sample_weights": {
-      "0": 3.066300148594797,
-      "1": 1.868754786455731,
-      "2": 2.0184858666546908,
-      "3": 0.8967358784141213,
-      "4": 0.675334510304333,
-      "5": 1.1653733584685408
+      "0": 1.3280563120772069,
+      "1": 1.3280563120772069,
+      "2": 1.3280563120772069,
+      "3": 0.9520332122040807,
+      "4": 0.9030782922125007,
+      "5": 1.0853064121111957
+    },
+    "combined_class_emphasis_caps": {
+      "focal_alpha_before_normalization": [
+        0.8,
+        1.35
+      ],
+      "sample_weight_before_normalization": [
+        0.85,
+        1.25
+      ]
     }
   },
   "fine_tuning": {
-    "unfrozen_backbone_layers": 35,
-    "optimizer": "Adam",
-    "learning_rate": 0.0001
+    "phases": [
+      {
+        "name": "head_warmup",
+        "epochs": 10,
+        "backbone_trainable_layers": 0,
+        "learning_rate": 0.001
+      },
+      {
+        "name": "backbone_finetune",
+        "epochs": 90,
+        "backbone_top_layers_selected": 30,
+        "batch_normalization_trainable": false,
+        "optimizer": "Adam",
+        "schedule": "CosineDecay",
+        "initial_learning_rate": 1e-05,
+        "final_learning_rate_fraction": 0.1
+      }
+    ],
+    "early_stopping_patience": 20,
+    "best_checkpoint_monitor": "val_loss"
+  },
+  "training_augmentation": {
+    "general": {
+      "rotation_degrees": 18,
+      "width_shift": 0.12,
+      "height_shift": 0.12,
+      "zoom": 0.2,
+      "horizontal_flip": true,
+      "random_contrast": [
+        0.88,
+        1.12
+      ]
+    },
+    "cvmi_3": {
+      "rotation_degrees": 20,
+      "width_shift": 0.15,
+      "height_shift": 0.15,
+      "zoom": 0.22,
+      "random_contrast": [
+        0.78,
+        1.22
+      ]
+    }
   },
   "roi_model_path": null,
   "roi_training_source": null,
@@ -70,43 +120,43 @@
   "evaluation_metrics": {
     "validation": {
       "sample_count": 127,
-      "overall_accuracy_percent": 42.52,
+      "overall_accuracy_percent": 36.22,
       "per_stage_accuracy": {
         "CVMI-1": {
-          "accuracy_percent": 25.0,
+          "accuracy_percent": 0.0,
           "support": 4
         },
         "CVMI-2": {
-          "accuracy_percent": 37.5,
+          "accuracy_percent": 0.0,
           "support": 8
         },
         "CVMI-3": {
-          "accuracy_percent": 25.0,
+          "accuracy_percent": 0.0,
           "support": 8
         },
         "CVMI-4": {
-          "accuracy_percent": 46.67,
+          "accuracy_percent": 20.0,
           "support": 30
         },
         "CVMI-5": {
-          "accuracy_percent": 40.35,
+          "accuracy_percent": 64.91,
           "support": 57
         },
         "CVMI-6": {
-          "accuracy_percent": 55.0,
+          "accuracy_percent": 15.0,
           "support": 20
         }
       },
-      "cohen_kappa": 0.2311,
-      "macro_f1_percent": 38.04,
-      "multiclass_brier_score": 0.70298,
-      "expected_calibration_error_percent": 8.2,
+      "cohen_kappa": 0.0105,
+      "macro_f1_percent": 15.02,
+      "multiclass_brier_score": 0.73554,
+      "expected_calibration_error_percent": 9.49,
       "reliability_note": "Kappa is model/reference-label agreement; ECE and Brier score are uncalibrated probability diagnostics, not clinical reliability certification.",
       "skeletal_age_regression": {
         "status": "evaluated",
         "sample_count": 127,
-        "mae_years": 1.001,
-        "rmse_years": 1.342,
+        "mae_years": 1.194,
+        "rmse_years": 1.553,
         "prediction_method": [
           "regression_head"
         ],
@@ -116,14 +166,14 @@
     },
     "test": {
       "sample_count": 126,
-      "overall_accuracy_percent": 36.51,
+      "overall_accuracy_percent": 38.1,
       "per_stage_accuracy": {
         "CVMI-1": {
-          "accuracy_percent": 50.0,
+          "accuracy_percent": 0.0,
           "support": 4
         },
         "CVMI-2": {
-          "accuracy_percent": 50.0,
+          "accuracy_percent": 0.0,
           "support": 4
         },
         "CVMI-3": {
@@ -131,28 +181,28 @@
           "support": 6
         },
         "CVMI-4": {
-          "accuracy_percent": 53.12,
+          "accuracy_percent": 25.0,
           "support": 32
         },
         "CVMI-5": {
-          "accuracy_percent": 22.03,
+          "accuracy_percent": 59.32,
           "support": 59
         },
         "CVMI-6": {
-          "accuracy_percent": 57.14,
+          "accuracy_percent": 23.81,
           "support": 21
         }
       },
-      "cohen_kappa": 0.1549,
-      "macro_f1_percent": 36.34,
-      "multiclass_brier_score": 0.69642,
-      "expected_calibration_error_percent": 5.66,
+      "cohen_kappa": 0.0169,
+      "macro_f1_percent": 17.08,
+      "multiclass_brier_score": 0.72011,
+      "expected_calibration_error_percent": 4.9,
       "reliability_note": "Kappa is model/reference-label agreement; ECE and Brier score are uncalibrated probability diagnostics, not clinical reliability certification.",
       "skeletal_age_regression": {
         "status": "evaluated",
         "sample_count": 126,
-        "mae_years": 0.905,
-        "rmse_years": 1.215,
+        "mae_years": 1.247,
+        "rmse_years": 1.565,
         "prediction_method": [
           "regression_head"
         ],

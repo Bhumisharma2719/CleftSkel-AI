@@ -7,7 +7,7 @@ CleftSkel-AI is a research prototype for reviewing lateral cephalogram X-rays. I
 ## Current capabilities
 
 - MobileNetV2 transfer-learning classifier for CVMI-1 through CVMI-6.
-- Class-balanced sparse focal loss plus normalized per-example weights computed from the training split and applied in the streaming `tf.data` pipeline.
+- Sparse categorical cross-entropy with raw scikit-learn balanced per-example CVM weights in the streaming `tf.data` pipeline.
 - Fine-tuning of the final MobileNetV2 layers with Adam (`1e-4`), image augmentation, `ReduceLROnPlateau`, early stopping, and best-checkpoint saving.
 - Parallel skeletal-age regression head. Training uses direct age labels when complete labels are supplied; otherwise it uses the checked-in stage-to-age proxy map and marks predictions as synthetic.
 - Top-two CVM scores and Grad-CAM overlay in the prediction response.
@@ -81,7 +81,7 @@ Each CVM annotation must map to an image with the same `ceph_id` (or annotation 
 
 ## Train the CVM model
 
-The default training configuration runs a frozen-backbone head warm-up, then selects the final 30 MobileNetV2 layers for fine-tuning while keeping batch-normalization layers frozen. The second phase uses Adam with a `1e-5` cosine-decay schedule. CVM classification combines balanced sparse focal loss (gamma 1.5) with capped, softened per-example weights to limit majority-class suppression. General augmentation uses rotation 18 degrees, shifts 0.12, zoom 0.20, horizontal flip, and contrast 0.88-1.12; CVMI-3 receives a wider rotation/shift/zoom/contrast range. Early stopping patience is 20 epochs; the best checkpoint is selected by validation loss when a validation split is available. When complete observed skeletal-age labels are absent, training uses the checked-in `stage_age_map.json` synthetic proxy targets for the secondary age head. The run uses up to 100 epochs and batch size 16.
+The default CVM run uses one training phase and fine-tunes the final 35 MobileNetV2 layers from the start while keeping batch-normalization layers frozen. It uses Adam at `1e-4`, sparse categorical cross-entropy for CVM classification, and mean squared error for the skeletal-age regression head. Raw scikit-learn balanced class weights are applied once as per-example weights to CVM samples; age targets use unit sample weights. Augmentation uses rotation up to 15 degrees, width/height shifts up to 0.10, zoom up to 0.15, and horizontal flipping. Early stopping patience is 20 epochs, ReduceLROnPlateau lowers the learning rate on plateaus, and ModelCheckpoint saves the best validation-loss checkpoint (or training-loss checkpoint if there is no validation split). When complete observed skeletal-age labels are absent, the checked-in `stage_age_map.json` supplies proxy targets; the one-command run below loads that map automatically. Training defaults to up to 100 epochs and batch size 16.
 
 Run from the project root:
 

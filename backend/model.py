@@ -282,26 +282,9 @@ def _model_output_dict(model, raw_output: Any) -> dict[str, np.ndarray]:
     return {name: as_array(raw_output)}
 
 
-def _make_balanced_sparse_focal_loss(tf, alpha_values: list[float], gamma: float):
-    """Build per-example sparse focal loss with moderate class alpha values."""
-    alpha_tensor = tf.constant(alpha_values, dtype=tf.float32)
-
-    def balanced_sparse_focal_loss(y_true, y_pred):
-        labels = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
-        probs = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
-        rows = tf.range(tf.shape(labels)[0], dtype=tf.int32)
-        true_class_prob = tf.gather_nd(probs, tf.stack([rows, labels], axis=1))
-        alpha = tf.gather(alpha_tensor, labels)
-        return -alpha * tf.pow(1.0 - true_class_prob, gamma) * tf.math.log(true_class_prob)
-
-    balanced_sparse_focal_loss.__name__ = "balanced_sparse_focal_loss"
-    return balanced_sparse_focal_loss
-
-
 def build_mobilenetv2_model(
     stage_values: list[int], train_age_head: bool = True,
-    imagenet_weights: str | None = "imagenet", fine_tune_layers: int = 0,
-    focal_alpha: list[float] | None = None, focal_gamma: float = 2.0,
+    imagenet_weights: str | None = "imagenet", fine_tune_layers: int = 35,
 ):
     """Build MobileNetV2 with CVM and optional age heads, fine-tuning its tail."""
     tf = _tensorflow()
@@ -327,18 +310,12 @@ def build_mobilenetv2_model(
     if train_age_head:
         outputs["skeletal_age_years"] = tf.keras.layers.Dense(1, name="skeletal_age_years")(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    alpha_values = focal_alpha or [1.0] * len(stage_values)
-    if len(alpha_values) != len(stage_values):
-        raise ValueError("focal_alpha must contain one weight for each CVM stage.")
-    losses: dict[str, Any] = {
-        "cvm_stage": _make_balanced_sparse_focal_loss(tf, alpha_values, focal_gamma)
-    }
+    losses: dict[str, Any] = {"cvm_stage": "sparse_categorical_crossentropy"}
     metrics: dict[str, Any] = {"cvm_stage": ["accuracy"]}
     if train_age_head:
         losses["skeletal_age_years"] = "mean_squared_error"
         metrics["skeletal_age_years"] = ["mean_absolute_error"]
-    # Phase one trains the task heads while the backbone remains frozen.
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss=losses, metrics=metrics)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss=losses, metrics=metrics)
     return model
 
 
@@ -411,28 +388,6 @@ def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
     ]
 
 
-def _best_checkpoint_callback(tf, destination: Path, validation_available: bool):
-    """Keep one best checkpoint across the frozen and fine-tuning phases."""
-    destination = destination.expanduser().resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    monitor = "val_loss" if validation_available else "loss"
-
-    class BestCheckpoint(tf.keras.callbacks.Callback):
-        def __init__(self):
-            super().__init__()
-            self.best = float("inf")
-
-        def on_epoch_end(self, epoch, logs=None):
-            current = (logs or {}).get(monitor)
-            if current is None or not np.isfinite(float(current)) or float(current) >= self.best:
-                return
-            self.best = float(current)
-            self.model.save(str(destination))
-            logger.info("Saved new best checkpoint at epoch %s with %s=%.6f", epoch + 1, monitor, self.best)
-
-    return BestCheckpoint()
-
-
 def _balanced_class_weights(labels: list[int]) -> dict[int, float]:
     """Compute sklearn's balanced weights for zero-based CVM class indices."""
     try:
@@ -445,23 +400,6 @@ def _balanced_class_weights(labels: list[int]) -> dict[int, float]:
     classes = np.unique(np.asarray(labels, dtype=np.int32))
     weights = compute_class_weight(class_weight="balanced", classes=classes, y=np.asarray(labels, dtype=np.int32))
     return {int(class_id): float(weight) for class_id, weight in zip(classes, weights)}
-
-
-def _focal_and_sample_weights(class_weights: dict[int, float], labels: list[int]) -> tuple[list[float], dict[int, float]]:
-    """Apply capped fourth-root balancing to avoid suppressing common stages."""
-    class_ids = sorted(class_weights)
-    softened = {class_id: float(class_weights[class_id] ** 0.25) for class_id in class_ids}
-
-    # Both components are bounded. Their product gives minority classes a
-    # useful lift without allowing rare-stage gradients to dominate training.
-    alpha_base = {class_id: float(np.clip(softened[class_id], 0.80, 1.35)) for class_id in class_ids}
-    alpha_mean = float(np.mean(list(alpha_base.values()))) or 1.0
-    focal_alpha = [alpha_base[class_id] / alpha_mean for class_id in class_ids]
-
-    sample_base = {class_id: float(np.clip(softened[class_id], 0.85, 1.25)) for class_id in class_ids}
-    population_mean = float(np.mean([sample_base[int(label)] for label in labels])) or 1.0
-    sample_weights = {class_id: sample_base[class_id] / population_mean for class_id in class_ids}
-    return focal_alpha, sample_weights
 
 
 def _coerce_cva_label(value: Any) -> int | None:
@@ -993,7 +931,9 @@ def train_cvmi_model(
     stage_to_index = {value: index for index, value in enumerate(stage_values)}
     train_stage_indices = [stage_to_index[record["cvm_stage"]] for record in splits["train"]]
     class_weights = _balanced_class_weights(train_stage_indices)
-    focal_alpha, balanced_sample_weights = _focal_and_sample_weights(class_weights, train_stage_indices)
+    # Use the unmodified scikit-learn balanced weights once as per-example
+    # weights for CVM classification. Age regression keeps unit sample weights.
+    balanced_sample_weights = class_weights
     roi_training_records = splits["train"] + splits.get("valid", [])
     has_roi_labels = bool(roi_training_records) and all(record["roi_box"] is not None for record in roi_training_records)
 
@@ -1040,15 +980,7 @@ def train_cvmi_model(
                         rgb = rgb.resize((image_size[1], image_size[0]))
                         pixels = np.asarray(rgb, dtype=np.float32)
                         if shuffle:
-                            cvmi3_augmenter = augmenter
-                            transform = cvmi3_augmenter if record["cvm_stage"] == 3 else augmenter
-                            pixels = transform.random_transform(pixels)
-                            contrast_bounds = (0.78, 1.22) if record["cvm_stage"] == 3 else (0.88, 1.12)
-                            pixels_tensor = tf.image.random_contrast(
-                                tf.convert_to_tensor(pixels, dtype=tf.float32),
-                                lower=contrast_bounds[0], upper=contrast_bounds[1],
-                            )
-                            pixels = tf.clip_by_value(pixels_tensor, 0.0, 255.0).numpy()
+                            pixels = augmenter.random_transform(pixels)
                 except (OSError, UnidentifiedImageError) as exc:
                     raise ValueError(f"Could not read image {record['image_path']}: {exc}") from exc
                 label = {"cvm_stage": np.int32(stage_index)}
@@ -1056,8 +988,8 @@ def train_cvmi_model(
                     target = record["skeletal_age_years"] if has_direct_age else mapped_age_map[record["cvm_stage"]]
                     label["skeletal_age_years"] = np.asarray([target], dtype=np.float32)
                 if shuffle:
-                    # tf.data streams a multi-output model. Apply the softened
-                    # class balance as per-example weights to the CVM loss only.
+                    # Apply raw balanced weights to the CVM task; keep age targets
+                    # at unit weight so the two outputs retain separate weighting.
                     sample_weight = {"cvm_stage": np.float32(balanced_sample_weights[stage_index])}
                     if has_age:
                         sample_weight["skeletal_age_years"] = np.float32(1.0)
@@ -1081,72 +1013,20 @@ def train_cvmi_model(
 
     train_ds = make_dataset(splits["train"], shuffle=True)
     valid_ds = make_dataset(splits.get("valid", []), shuffle=False)
+    # One stable training phase: fine-tune the final MobileNetV2 feature layers
+    # from the start, while keeping BatchNorm layers frozen for this dataset size.
     model = build_mobilenetv2_model(
-        stage_values, train_age_head=has_age, fine_tune_layers=0,
-        focal_alpha=focal_alpha, focal_gamma=1.5,
+        stage_values, train_age_head=has_age, fine_tune_layers=35,
     )
     destination = Path(output_path).expanduser().resolve()
     monitor = "val_loss" if valid_ds is not None else "loss"
-    checkpoint_callback = _best_checkpoint_callback(tf, destination, valid_ds is not None)
-    steps_per_epoch = max(1, int(np.ceil(len(splits["train"]) / batch_size)))
-    warmup_epochs = min(10, max(1, int(round(epochs * 0.10))))
-    warmup_callbacks = [
-        checkpoint_callback,
-        tf.keras.callbacks.EarlyStopping(
-            monitor=monitor, mode="min", patience=20, restore_best_weights=True, verbose=1,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor=monitor, mode="min", factor=0.2, patience=5,
-            min_lr=1e-5, cooldown=1, verbose=1,
-        ),
-    ]
+    callbacks = _checkpoint_callbacks(tf, destination, valid_ds is not None)
     model.fit(
-        train_ds, validation_data=valid_ds, epochs=warmup_epochs,
-        steps_per_epoch=steps_per_epoch, callbacks=warmup_callbacks,
+        train_ds, validation_data=valid_ds, epochs=epochs, callbacks=callbacks,
     )
 
-    finetune_epochs = max(0, int(epochs) - warmup_epochs)
-    if finetune_epochs:
-        backbone = next(
-            layer for layer in model.layers
-            if isinstance(layer, tf.keras.Model) and "mobilenetv2" in layer.name.lower()
-        )
-        backbone.trainable = True
-        freeze_before = max(0, len(backbone.layers) - 30)
-        for layer in backbone.layers[:freeze_before]:
-            layer.trainable = False
-        for layer in backbone.layers[freeze_before:]:
-            layer.trainable = not isinstance(layer, tf.keras.layers.BatchNormalization)
-
-        cosine_decay = tf.keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=1e-5,
-            decay_steps=max(1, steps_per_epoch * finetune_epochs),
-            alpha=0.10,
-        )
-        fine_tune_losses: dict[str, Any] = {
-            "cvm_stage": _make_balanced_sparse_focal_loss(tf, focal_alpha, 1.5)
-        }
-        fine_tune_metrics: dict[str, Any] = {"cvm_stage": ["accuracy"]}
-        if has_age:
-            fine_tune_losses["skeletal_age_years"] = "mean_squared_error"
-            fine_tune_metrics["skeletal_age_years"] = ["mean_absolute_error"]
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=cosine_decay),
-            loss=fine_tune_losses, metrics=fine_tune_metrics,
-        )
-        model.fit(
-            train_ds, validation_data=valid_ds, epochs=finetune_epochs,
-            steps_per_epoch=steps_per_epoch,
-            callbacks=[
-                checkpoint_callback,
-                tf.keras.callbacks.EarlyStopping(
-                    monitor=monitor, mode="min", patience=20,
-                    restore_best_weights=True, verbose=1,
-                ),
-            ],
-        )
-
-    # Reload the best checkpoint across both phases, selected by validation loss.
+    # Reload the best checkpoint selected by validation loss (or training loss
+    # when the dataset has no validation split).
     model = tf.keras.models.load_model(destination, compile=False)
 
     stage_titles = {str(stage): f"CVMI-{stage}" for stage in stage_values}
@@ -1165,24 +1045,25 @@ def train_cvmi_model(
         "stage_age_map": {str(key): value for key, value in mapped_age_map.items()} if has_mapped_age else None,
         "cvm_class_weights": {str(key): value for key, value in class_weights.items()},
         "cvm_balancing": {
-            "classification_loss": "balanced_sparse_focal_loss",
-            "focal_gamma": 1.5,
-            "focal_alpha": focal_alpha,
-            "sample_weight_strategy": "capped_normalized_fourth_root_class_weight",
+            "classification_loss": "sparse_categorical_crossentropy",
+            "sample_weight_strategy": "raw_scikit_learn_balanced_class_weight",
             "sample_weights": {str(key): value for key, value in balanced_sample_weights.items()},
-            "combined_class_emphasis_caps": {"focal_alpha_before_normalization": [0.80, 1.35], "sample_weight_before_normalization": [0.85, 1.25]},
         },
         "fine_tuning": {
-            "phases": [
-                {"name": "head_warmup", "epochs": warmup_epochs, "backbone_trainable_layers": 0, "learning_rate": 1e-3},
-                {"name": "backbone_finetune", "epochs": finetune_epochs, "backbone_top_layers_selected": 30, "batch_normalization_trainable": False, "optimizer": "Adam", "schedule": "CosineDecay", "initial_learning_rate": 1e-5, "final_learning_rate_fraction": 0.10},
-            ],
+            "strategy": "single_phase",
+            "backbone_top_layers_selected": 35,
+            "batch_normalization_trainable": False,
+            "optimizer": "Adam",
+            "learning_rate": 1e-4,
             "early_stopping_patience": 20,
             "best_checkpoint_monitor": monitor,
         },
         "training_augmentation": {
-            "general": {"rotation_degrees": 18, "width_shift": 0.12, "height_shift": 0.12, "zoom": 0.20, "horizontal_flip": True, "random_contrast": [0.88, 1.12]},
-            "cvmi_3": {"rotation_degrees": 20, "width_shift": 0.15, "height_shift": 0.15, "zoom": 0.22, "random_contrast": [0.78, 1.22]},
+            "rotation_degrees": 15,
+            "width_shift": 0.10,
+            "height_shift": 0.10,
+            "zoom": 0.15,
+            "horizontal_flip": True,
         },
         "roi_model_path": roi_destination.name if has_roi_labels else None,
         "roi_training_source": "c2_c3_c4_box_annotations" if has_roi_labels else None,
@@ -1236,8 +1117,7 @@ def _get_model():
         if not MODEL_PATH.is_file():
             raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Train it with `python backend/model.py --train`.")
         tf = _tensorflow()
-        # Inference does not need a compiled optimizer/loss. compile=False also
-        # supports checkpoints saved with the training-time focal-loss closure.
+        # Inference does not need a compiled optimizer or loss.
         loaded_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
         if not LABELS_PATH.is_file():
             raise FileNotFoundError(f"Model metadata not found at {LABELS_PATH}.")

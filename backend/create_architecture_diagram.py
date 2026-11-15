@@ -68,11 +68,11 @@ def main():
             face=BLUE)
     add_box(ax, (0.5, 0.715), (0.80, 0.155),
             "Preprocessing and Training Augmentation",
-            "Resize: 224 x 224 RGB; MobileNetV2 preprocessing\nGeneral: +/-18 deg; shifts 0.12; zoom 0.20; contrast 0.88-1.12\nCVMI-3: +/-20 deg; shifts 0.15; zoom 0.22; contrast 0.78-1.22",
+            "Resize: 224 x 224 RGB; MobileNetV2 preprocessing\nRotation +/-15 deg; shifts 0.10; zoom 0.15; horizontal flip",
             face=PALE)
     add_box(ax, (0.5, 0.535), (0.78, 0.13),
             "MobileNetV2 Shared Feature Extractor",
-            "Phase 1: frozen-backbone warm-up; 10 epochs at Adam 1e-3\nPhase 2: top 30 layers selected; batch normalization frozen\nAdam 1e-5 with CosineDecay; batch size 16; maximum 100 epochs",
+            "Single phase: final 35 layers fine-tuned; batch normalization frozen\nAdam learning rate 1e-4; batch size 16; maximum 100 epochs",
             face=BLUE)
     add_arrow(ax, (0.5, 0.8175), (0.5, 0.7925))
     add_arrow(ax, (0.5, 0.6375), (0.5, 0.60))
@@ -80,7 +80,7 @@ def main():
     # Parallel task outputs.
     add_box(ax, (0.275, 0.345), (0.42, 0.15),
             "Branch A: CVM Classification",
-            "6-class softmax: CVMI-1 through CVMI-6\nBalanced sparse focal loss (gamma=1.5)\nCapped class alpha and softened sample weights",
+            "6-class softmax: CVMI-1 through CVMI-6\nSparse categorical cross-entropy\nRaw balanced training sample weights",
             face=TEAL, edge="#3E8B83", title_size=11.5)
     add_box(ax, (0.725, 0.345), (0.42, 0.15),
             "Branch B: Skeletal-Age Regression",
@@ -106,7 +106,7 @@ def main():
     ax.text(
         0.5, 0.065,
         "Best validation-loss checkpoint; early stopping patience 20; "
-        "warm-up ReduceLROnPlateau factor 0.2, patience 5; cosine decay during fine-tuning.",
+        "ReduceLROnPlateau factor 0.2, patience 5 (minimum LR 1e-7).",
         ha="center", va="center", fontsize=8.2, color=SLATE,
     )
     ax.text(0.5, 0.028,

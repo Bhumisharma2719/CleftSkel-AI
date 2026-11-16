@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import threading
 from collections import OrderedDict
@@ -52,6 +53,22 @@ _prediction_cache: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
 _model_generation = 0
 _PREDICTION_CACHE_LIMIT = int(os.getenv("CLEFTSKEL_PREDICTION_CACHE_SIZE", "64"))
 logger = logging.getLogger("cleftskel.model")
+TRAINING_SEED = 42
+
+
+def _set_global_training_seed(seed: int = TRAINING_SEED):
+    """Seed Python, NumPy, and TensorFlow before data/model construction."""
+    random.seed(seed)
+    np.random.seed(seed)
+    tf = _tensorflow()
+    tf.random.set_seed(seed)
+    # Request deterministic kernels where TensorFlow and the active device
+    # support them. Re-seeding remains useful even on unsupported platforms.
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except (AttributeError, RuntimeError, ValueError) as exc:
+        logger.warning("TensorFlow deterministic operations could not be enabled: %s", exc)
+    return tf
 
 
 def _generate_gradcam_overlay(model, pixels: np.ndarray, source_image: Image.Image, class_index: int) -> dict[str, Any]:
@@ -369,9 +386,29 @@ def _training_image_augmenter(
 
 
 def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
+    if not validation_available:
+        raise ValueError(
+            "A validation split is required to save the best checkpoint by val_loss. "
+            "Provide a dataset with a validation partition."
+        )
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    monitor = "val_loss" if validation_available else "loss"
+    monitor = "val_loss"
+
+    class ValidationAccuracyLogger(tf.keras.callbacks.Callback):
+        """Print classifier validation accuracy once per completed epoch."""
+        def on_epoch_end(self, epoch, logs=None):
+            logs = logs or {}
+            accuracy_items = [
+                (name, value) for name, value in logs.items()
+                if name.startswith("val_") and "accuracy" in name.lower()
+            ]
+            if accuracy_items:
+                metrics = ", ".join(f"{name}={float(value):.4f}" for name, value in accuracy_items)
+                print(f"Epoch {epoch + 1}: {metrics}", flush=True)
+            else:
+                print(f"Epoch {epoch + 1}: validation accuracy metric unavailable", flush=True)
+
     return [
         tf.keras.callbacks.ModelCheckpoint(
             filepath=str(destination), monitor=monitor, mode="min",
@@ -385,6 +422,7 @@ def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
             monitor=monitor, mode="min", factor=0.2, patience=5,
             min_lr=1e-7, cooldown=1, verbose=1,
         ),
+        ValidationAccuracyLogger(),
     ]
 
 
@@ -549,7 +587,7 @@ def train_cva_model(
             "model_path": str(output_path),
         }
 
-    tf = _tensorflow()
+    tf = _set_global_training_seed()
     records_by_split = {
         split: [dict(row, cva_present=labels[row["image_id"]]) for row in rows if row["image_id"] in labels]
         for split, rows in splits.items()
@@ -583,11 +621,13 @@ def train_cva_model(
             output_signature=(tf.TensorSpec(shape=(*IMAGE_SIZE, 3), dtype=tf.float32), tf.TensorSpec(shape=(1,), dtype=tf.float32)),
         )
         if shuffle:
-            ds = ds.shuffle(min(len(records), 1000), reshuffle_each_iteration=True)
+            ds = ds.shuffle(min(len(records), 1000), seed=TRAINING_SEED, reshuffle_each_iteration=True)
         return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     valid_records = records_by_split.get("valid", [])
     test_records = records_by_split.get("test", [])
+    if not valid_records:
+        raise ValueError("CVA training requires a validation partition to select the best val_loss checkpoint.")
     model = build_cva_classifier()
     destination = Path(output_path).expanduser().resolve()
     callbacks = _checkpoint_callbacks(tf, destination, bool(valid_records))
@@ -893,8 +933,10 @@ def train_cvmi_model(
     roi_boxes_csv: str | Path | None = None,
 ) -> dict[str, Any]:
     """Train MobileNetV2 from Aariz and save the model plus stage metadata."""
-    tf = _tensorflow()
+    tf = _set_global_training_seed()
     splits = load_aariz_dataset(dataset_dir, age_labels_csv, roi_boxes_csv)
+    if not splits.get("valid"):
+        raise ValueError("CVM training requires a validation partition to select the best val_loss checkpoint.")
     stage_values = sorted({r["cvm_stage"] for r in splits["train"]})
     if stage_values != [1, 2, 3, 4, 5, 6]:
         raise ValueError(f"CVM classifier requires labeled CVMI stages 1 through 6; found {stage_values}.")
@@ -951,7 +993,7 @@ def train_cvmi_model(
                 output_signature=(tf.TensorSpec(shape=(*image_size, 3), dtype=tf.float32), tf.TensorSpec(shape=(4,), dtype=tf.float32)),
             )
             if shuffle:
-                ds = ds.shuffle(min(len(records), 1000), reshuffle_each_iteration=True)
+                ds = ds.shuffle(min(len(records), 1000), seed=TRAINING_SEED, reshuffle_each_iteration=True)
             return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
         roi_model = build_roi_localizer()
@@ -1008,7 +1050,7 @@ def train_cvmi_model(
             })
         dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
         if shuffle:
-            dataset = dataset.shuffle(min(len(records), 1000), reshuffle_each_iteration=True)
+            dataset = dataset.shuffle(min(len(records), 1000), seed=TRAINING_SEED, reshuffle_each_iteration=True)
         return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     train_ds = make_dataset(splits["train"], shuffle=True)
@@ -1019,14 +1061,13 @@ def train_cvmi_model(
         stage_values, train_age_head=has_age, fine_tune_layers=35,
     )
     destination = Path(output_path).expanduser().resolve()
-    monitor = "val_loss" if valid_ds is not None else "loss"
+    monitor = "val_loss"
     callbacks = _checkpoint_callbacks(tf, destination, valid_ds is not None)
     model.fit(
         train_ds, validation_data=valid_ds, epochs=epochs, callbacks=callbacks,
     )
 
-    # Reload the best checkpoint selected by validation loss (or training loss
-    # when the dataset has no validation split).
+    # Reload the best checkpoint selected by validation loss.
     model = tf.keras.models.load_model(destination, compile=False)
 
     stage_titles = {str(stage): f"CVMI-{stage}" for stage in stage_values}
@@ -1042,6 +1083,7 @@ def train_cvmi_model(
         "has_skeletal_age_head": has_age,
         "skeletal_age_head_architecture": "parallel_dense_regression" if has_age else None,
         "age_target_source": age_target_source,
+        "training_seed": TRAINING_SEED,
         "stage_age_map": {str(key): value for key, value in mapped_age_map.items()} if has_mapped_age else None,
         "cvm_class_weights": {str(key): value for key, value in class_weights.items()},
         "cvm_balancing": {

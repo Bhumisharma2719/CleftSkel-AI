@@ -320,7 +320,13 @@ def build_mobilenetv2_model(
         layer.trainable = not isinstance(layer, tf.keras.layers.BatchNormalization)
     x = backbone(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Dropout(0.25)(x)
+    x = tf.keras.layers.Dense(
+        128,
+        activation="relu",
+        kernel_regularizer=tf.keras.regularizers.l2(1e-4),
+        name="task_features",
+    )(x)
+    x = tf.keras.layers.Dropout(0.35, name="task_dropout")(x)
     outputs: dict[str, Any] = {
         "cvm_stage": tf.keras.layers.Dense(len(stage_values), activation="softmax", name="cvm_stage")(x)
     }
@@ -332,7 +338,17 @@ def build_mobilenetv2_model(
     if train_age_head:
         losses["skeletal_age_years"] = "mean_squared_error"
         metrics["skeletal_age_years"] = ["mean_absolute_error"]
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss=losses, metrics=metrics)
+    loss_weights = {"cvm_stage": 1.0}
+    if train_age_head:
+        # Age is measured in years, so its raw MSE scale is much larger than
+        # categorical cross-entropy. Weight it to keep both task gradients useful.
+        loss_weights["skeletal_age_years"] = 0.01
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        loss=losses,
+        loss_weights=loss_weights,
+        metrics=metrics,
+    )
     return model
 
 
@@ -385,15 +401,46 @@ def _training_image_augmenter(
     )
 
 
-def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
+def _checkpoint_callbacks(
+    tf,
+    destination: Path,
+    validation_available: bool,
+    checkpoint_monitor: str = "val_accuracy",
+    classification_loss_monitor: str = "val_loss",
+    macro_f1_dataset=None,
+    num_classes: int | None = None,
+):
     if not validation_available:
         raise ValueError(
-            "A validation split is required to save the best checkpoint by val_loss. "
+            "A validation split is required to save the best classification checkpoint. "
             "Provide a dataset with a validation partition."
         )
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    monitor = "val_loss"
+
+    class ValidationMacroF1(tf.keras.callbacks.Callback):
+        """Compute unweighted macro F1 on validation examples each epoch."""
+        def on_epoch_end(self, epoch, logs=None):
+            logs = logs if logs is not None else {}
+            confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+            for batch in macro_f1_dataset:
+                inputs, targets = batch[0], batch[1]
+                raw_outputs = self.model(inputs, training=False)
+                probabilities = _model_output_dict(self.model, raw_outputs)["cvm_stage"]
+                predicted = np.argmax(probabilities, axis=1).astype(np.int64)
+                expected = np.asarray(targets["cvm_stage"].numpy(), dtype=np.int64).reshape(-1)
+                np.add.at(confusion, (expected, predicted), 1)
+            true_positive = np.diag(confusion).astype(np.float64)
+            denominators = confusion.sum(axis=0) + confusion.sum(axis=1)
+            per_class_f1 = np.divide(
+                2.0 * true_positive,
+                denominators,
+                out=np.zeros_like(true_positive),
+                where=denominators > 0,
+            )
+            macro_f1 = float(np.mean(per_class_f1))
+            logs["val_cvm_macro_f1"] = macro_f1
+            print(f"Epoch {epoch + 1}: val_cvm_macro_f1={macro_f1:.4f}", flush=True)
 
     class ValidationAccuracyLogger(tf.keras.callbacks.Callback):
         """Print classifier validation accuracy once per completed epoch."""
@@ -409,35 +456,42 @@ def _checkpoint_callbacks(tf, destination: Path, validation_available: bool):
             else:
                 print(f"Epoch {epoch + 1}: validation accuracy metric unavailable", flush=True)
 
-    return [
+    callbacks = []
+    if macro_f1_dataset is not None:
+        if not num_classes:
+            raise ValueError("num_classes is required when selecting checkpoints by validation macro F1.")
+        # This callback must precede ModelCheckpoint so it can add the metric to logs.
+        callbacks.append(ValidationMacroF1())
+    callbacks.extend([
         tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(destination), monitor=monitor, mode="min",
+            filepath=str(destination), monitor=checkpoint_monitor, mode="max",
             save_best_only=True, save_weights_only=False, verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor=monitor, mode="min", patience=20, restore_best_weights=True,
+            monitor=checkpoint_monitor, mode="max", patience=20, restore_best_weights=True,
             verbose=1,
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor=monitor, mode="min", factor=0.2, patience=5,
+            monitor=classification_loss_monitor, mode="min", factor=0.2, patience=5,
             min_lr=1e-7, cooldown=1, verbose=1,
         ),
         ValidationAccuracyLogger(),
-    ]
+    ])
+    return callbacks
 
 
 def _balanced_class_weights(labels: list[int]) -> dict[int, float]:
-    """Compute sklearn's balanced weights for zero-based CVM class indices."""
-    try:
-        from sklearn.utils.class_weight import compute_class_weight
-    except ImportError as exc:
-        raise RuntimeError(
-            "scikit-learn is required for balanced CVM class weights. "
-            "Install backend/requirements.txt."
-        ) from exc
-    classes = np.unique(np.asarray(labels, dtype=np.int32))
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=np.asarray(labels, dtype=np.int32))
-    return {int(class_id): float(weight) for class_id, weight in zip(classes, weights)}
+    """Return square-root smoothed balanced weights, clipped to [0.5, 2.5]."""
+    labels_array = np.asarray(labels, dtype=np.int32)
+    if labels_array.size == 0:
+        raise ValueError("Cannot compute class weights without training labels.")
+    classes, counts = np.unique(labels_array, return_counts=True)
+    sample_count = int(labels_array.size)
+    class_count = int(classes.size)
+    return {
+        int(class_id): float(np.clip(np.sqrt(sample_count / (class_count * int(count))), 0.5, 2.5))
+        for class_id, count in zip(classes, counts)
+    }
 
 
 def _coerce_cva_label(value: Any) -> int | None:
@@ -627,7 +681,7 @@ def train_cva_model(
     valid_records = records_by_split.get("valid", [])
     test_records = records_by_split.get("test", [])
     if not valid_records:
-        raise ValueError("CVA training requires a validation partition to select the best val_loss checkpoint.")
+        raise ValueError("CVA training requires a validation partition to select the best validation-accuracy checkpoint.")
     model = build_cva_classifier()
     destination = Path(output_path).expanduser().resolve()
     callbacks = _checkpoint_callbacks(tf, destination, bool(valid_records))
@@ -1061,13 +1115,22 @@ def train_cvmi_model(
         stage_values, train_age_head=has_age, fine_tune_layers=35,
     )
     destination = Path(output_path).expanduser().resolve()
-    monitor = "val_loss"
-    callbacks = _checkpoint_callbacks(tf, destination, valid_ds is not None)
+    monitor = "val_cvm_macro_f1"
+    callbacks = _checkpoint_callbacks(
+        tf,
+        destination,
+        valid_ds is not None,
+        checkpoint_monitor=monitor,
+        classification_loss_monitor="val_cvm_stage_loss",
+        macro_f1_dataset=valid_ds,
+        num_classes=len(stage_values),
+    )
     model.fit(
         train_ds, validation_data=valid_ds, epochs=epochs, callbacks=callbacks,
     )
 
-    # Reload the best checkpoint selected by validation loss.
+    # Reload the epoch with the highest validation macro F1, independent of
+    # fluctuations in the regression head's loss scale.
     model = tf.keras.models.load_model(destination, compile=False)
 
     stage_titles = {str(stage): f"CVMI-{stage}" for stage in stage_values}
@@ -1088,9 +1151,12 @@ def train_cvmi_model(
         "cvm_class_weights": {str(key): value for key, value in class_weights.items()},
         "cvm_balancing": {
             "classification_loss": "sparse_categorical_crossentropy",
-            "sample_weight_strategy": "raw_scikit_learn_balanced_class_weight",
+            "sample_weight_strategy": "square_root_smoothed_balanced_weight_clipped_0.5_to_2.5",
+            "weight_formula": "sqrt(N / (K * class_count)), clipped to [0.5, 2.5]",
             "sample_weights": {str(key): value for key, value in balanced_sample_weights.items()},
         },
+        "loss_weights": {"cvm_stage": 1.0, "skeletal_age_years": 0.01},
+        "task_head": {"dense_units": 128, "dropout": 0.35, "l2_kernel_regularization": 1e-4},
         "fine_tuning": {
             "strategy": "single_phase",
             "backbone_top_layers_selected": 35,

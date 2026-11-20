@@ -3,8 +3,8 @@
 Run from the repository root:
     python backend/distribution_png.py
 
-The script uses the same dataset loader and scikit-learn class-weight function
-as model.py, avoiding stale hard-coded counts.
+The script uses the same dataset loader and smoothed class-weight calculation
+as model.py, avoiding stale hard-coded counts or weight values.
 """
 
 from __future__ import annotations
@@ -79,18 +79,23 @@ def main() -> None:
     )
     weight_ax.bar_label(weights_bars, labels=[f"{value:.2f}" for value in plotted_weights], padding=3, fontsize=8)
     weight_ax.axhline(1.0, color="#C18A35", linewidth=1.2, linestyle="--", label="Neutral weight = 1")
-    weight_ax.set_title("Scikit-learn balanced class weights", fontsize=12, weight="bold", color="#18324B", pad=12)
+    weight_ax.set_title("Smoothed CVM sample weights", fontsize=12, weight="bold", color="#18324B", pad=12)
     weight_ax.set_xlabel("Cervical vertebral maturation stage", fontsize=9.5, labelpad=8)
-    weight_ax.set_ylabel("Scikit-learn source weight", fontsize=9.5, labelpad=8)
+    weight_ax.set_ylabel("Applied multiplier", fontsize=9.5, labelpad=8)
     weight_ax.tick_params(axis="both", labelsize=8.3)
     weight_ax.grid(axis="y", linestyle="--", alpha=0.3)
     weight_ax.set_axisbelow(True)
     weight_ax.legend(frameon=False, fontsize=8, loc="upper right")
 
-    fig.suptitle("Aariz CVM Training Distribution and Imbalance Weights", fontsize=15, weight="bold", color="#18324B", y=0.99)
+    total_count = sum(sum(counts[split].values()) for split in splits_to_plot)
+    split_counts = " / ".join(str(sum(counts[split].values())) for split in splits_to_plot)
+    fig.suptitle(
+        f"Aariz CVM Distribution ({split_counts}; total={total_count}) and Smoothed Weights",
+        fontsize=14, weight="bold", color="#18324B", y=0.99,
+    )
     fig.text(
         0.5, 0.015,
-        "Counts use matched records. Raw scikit-learn balanced weights are applied once as CVM sample weights.",
+        "Weights = sqrt(N / (K x class count)), clipped to [0.5, 2.5]; applied to CVM samples only.",
         ha="center", va="bottom", fontsize=7.5, color="#516A80",
     )
     fig.tight_layout(rect=(0.02, 0.055, 0.98, 0.94), w_pad=2.6)
@@ -106,7 +111,7 @@ def main() -> None:
     )
     print(f"Saved distribution plot: {output_path}")
     print(split_summary)
-    print("Training weights: " + ", ".join(f"CVMI-{stage}={class_weights[stage - 1]:.4f}" for stage in STAGES))
+    print("Smoothed training weights: " + ", ".join(f"CVMI-{stage}={class_weights[stage - 1]:.4f}" for stage in STAGES))
 
 
 if __name__ == "__main__":

@@ -58,7 +58,7 @@ def main():
 
     ax.text(0.5, 0.978, "CleftSkel-AI System Architecture", ha="center", va="top",
             fontsize=19, fontweight="bold", color=NAVY)
-    ax.text(0.5, 0.946, "Multi-task CVM stage and skeletal-age proxy analysis",
+    ax.text(0.5, 0.946, "Preserved baseline: CVM classification plus skeletal-age proxy regression",
             ha="center", va="top", fontsize=10, color=SLATE)
 
     # Sequential image processing and shared feature extraction.
@@ -72,7 +72,7 @@ def main():
             face=PALE)
     add_box(ax, (0.5, 0.535), (0.78, 0.13),
             "MobileNetV2 Shared Feature Extractor",
-            "Single phase: final 35 layers fine-tuned; batch normalization frozen\nAdam learning rate 1e-4; batch size 16; maximum 100 epochs",
+            "Final 35 layers fine-tuned; batch normalization frozen; Adam 1e-4\n128-unit ReLU task layer; L2 1e-4; dropout 0.35; seed 42",
             face=BLUE)
     add_arrow(ax, (0.5, 0.8175), (0.5, 0.7925))
     add_arrow(ax, (0.5, 0.6375), (0.5, 0.60))
@@ -80,11 +80,11 @@ def main():
     # Parallel task outputs.
     add_box(ax, (0.275, 0.345), (0.42, 0.15),
             "Branch A: CVM Classification",
-            "6-class softmax: CVMI-1 through CVMI-6\nSparse categorical cross-entropy\nRaw balanced training sample weights",
+            "6-class softmax; sparse categorical cross-entropy\nWeights: sqrt(N / (K x class count)), clipped [0.5, 2.5]\nValidation macro-F1 checkpoint selection",
             face=TEAL, edge="#3E8B83", title_size=11.5)
     add_box(ax, (0.725, 0.345), (0.42, 0.15),
             "Branch B: Skeletal-Age Regression",
-            "Parallel linear output in years\nDefault training targets are stage proxies:\n9.0, 10.5, 12.0, 13.5, 15.0, 16.0",
+            "Parallel linear output in years; MSE loss weight 0.01\nProxy ages from stage_age_map.json:\n9.0, 10.5, 12.0, 13.5, 15.0, 16.0",
             face=GOLD, edge="#B88A3B", title_size=11.5)
     add_arrow(ax, (0.43, 0.47), (0.32, 0.42), rad=0.04)
     add_arrow(ax, (0.57, 0.47), (0.68, 0.42), rad=-0.04)
@@ -105,13 +105,16 @@ def main():
 
     ax.text(
         0.5, 0.065,
-        "Best validation-loss checkpoint; early stopping patience 20; "
-        "ReduceLROnPlateau factor 0.2, patience 5 (minimum LR 1e-7).",
+        "Aariz splits: 588 train / 127 validation / 126 test (N=841). "
+        "Baseline accuracy: 44.09% validation / 46.03% test; macro-F1: 17.71% / 19.75%.",
         ha="center", va="center", fontsize=8.2, color=SLATE,
     )
-    ax.text(0.5, 0.028,
+    ax.text(0.5, 0.038,
+            "Separate experiment: model_v2.py uses deterministic balanced stage sampling and writes mobilenetv2_v2.keras.",
+            ha="center", va="center", fontsize=7.8, color=SLATE)
+    ax.text(0.5, 0.015,
             "Research prototype. Stage-mapped ages are synthetic proxies; clinician validation is required.",
-            ha="center", va="center", fontsize=8.1, color=SLATE, style="italic")
+            ha="center", va="center", fontsize=8.0, color=SLATE, style="italic")
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUTPUT, dpi=300, bbox_inches="tight", facecolor=WHITE)

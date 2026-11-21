@@ -181,5 +181,10 @@
     "cva_detection_accuracy_percent": 83.0,
     "cvmi_6_accuracy_percent": null,
     "note": "The abstract reports up to 88% for skeletal maturity, not specifically CVMI-6. These are separate-study reference figures and are not targets achieved by this checkpoint."
-  }
+  },
+  "checkpoint_output_names": [
+    "cvm_stage",
+    "skeletal_age_years"
+  ],
+  "evaluation_age_proxy_map_used": false
 }

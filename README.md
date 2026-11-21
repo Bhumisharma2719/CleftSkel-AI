@@ -7,8 +7,8 @@ CleftSkel-AI is a research prototype for reviewing lateral cephalogram X-rays. I
 ## Current capabilities
 
 - MobileNetV2 transfer-learning classifier for CVMI-1 through CVMI-6.
-- Sparse categorical cross-entropy with raw scikit-learn balanced per-example CVM weights in the streaming `tf.data` pipeline.
-- Fine-tuning of the final MobileNetV2 layers with Adam (`1e-4`), image augmentation, `ReduceLROnPlateau`, early stopping, and best-checkpoint saving.
+- Baseline classifier uses sparse categorical cross-entropy, square-root-smoothed class weights clipped to `[0.5, 2.5]`, and a 128-unit ReLU task layer with L2 regularization (`1e-4`) and dropout (`0.35`).
+- Baseline checkpoint selection uses validation macro F1. Training is seeded with `42`, fine-tunes the final 35 MobileNetV2 layers with Adam (`1e-4`), and uses augmentation, `ReduceLROnPlateau`, and early stopping.
 - Parallel skeletal-age regression head. Training uses direct age labels when complete labels are supplied; otherwise it uses the checked-in stage-to-age proxy map and marks predictions as synthetic.
 - Top-two CVM scores and Grad-CAM overlay in the prediction response.
 - Optional C2-C4 ROI localizer, trained only when normalized ROI box annotations are supplied.
@@ -26,7 +26,8 @@ CleftSkel-AI/
 |   |-- artifacts/                 # Local checkpoints, metrics, generated diagram (gitignored)
 |   |-- create_architecture_diagram.py
 |   |-- main.py                    # FastAPI endpoints and PDF dossier
-|   |-- model.py                   # Dataset, training, evaluation, inference, Grad-CAM
+|   |-- model.py                   # Stable baseline: dataset, training, evaluation, inference
+|   |-- model_v2.py                # Isolated balanced-sampling experiment and V2 artifacts
 |   `-- requirements.txt
 |-- frontend/
 |   `-- index.html                 # Tailwind dashboard and browser-side interactions
@@ -79,9 +80,11 @@ Aariz/
 
 Each CVM annotation must map to an image with the same `ceph_id` (or annotation filename stem) and contain a numeric stage from 1 to 6.
 
+The current Aariz split contains 588 train, 127 validation, and 126 test images (841 total). The validation and test counts are also recorded in the saved evaluation JSON.
+
 ## Train the CVM model
 
-The default CVM run uses one training phase and fine-tunes the final 35 MobileNetV2 layers from the start while keeping batch-normalization layers frozen. It uses Adam at `1e-4`, sparse categorical cross-entropy for CVM classification, and mean squared error for the skeletal-age regression head. Raw scikit-learn balanced class weights are applied once as per-example weights to CVM samples; age targets use unit sample weights. Augmentation uses rotation up to 15 degrees, width/height shifts up to 0.10, zoom up to 0.15, and horizontal flipping. Early stopping patience is 20 epochs, ReduceLROnPlateau lowers the learning rate on plateaus, and ModelCheckpoint saves the best validation-loss checkpoint (or training-loss checkpoint if there is no validation split). When complete observed skeletal-age labels are absent, the checked-in `stage_age_map.json` supplies proxy targets; the one-command run below loads that map automatically. Training defaults to up to 100 epochs and batch size 16.
+The stable baseline uses a shared 128-unit ReLU task layer with L2 `1e-4` and dropout `0.35` before both heads. The CVM head uses sparse categorical cross-entropy; class weights use `sqrt(N / (K * class_count))`, clipped to `[0.5, 2.5]`, and apply only to the CVM loss. The skeletal-age head uses MSE with loss weight `0.01`; when complete observed age labels are absent, `stage_age_map.json` supplies synthetic proxy targets. The model fine-tunes the final 35 MobileNetV2 layers with batch normalization frozen, Adam at `1e-4`, seed `42`, and augmentation (rotation 15 degrees, shifts 0.10, zoom 0.15, horizontal flip). ModelCheckpoint and EarlyStopping monitor validation macro F1; ReduceLROnPlateau monitors CVM validation loss. Training defaults to up to 100 epochs and batch size 16.
 
 Run from the project root:
 
@@ -102,6 +105,22 @@ python backend\model.py --train --dataset "C:\Users\Bhumi\Desktop\Aariz" --age-l
 ```
 
 Training writes `backend/artifacts/mobilenetv2.keras` and its `.labels.json` metadata sidecar by default. Model artifacts are gitignored; keep local backups of checkpoints and metrics you need.
+
+### Experimental model v2
+
+`backend/model_v2.py` is an isolated next iteration. It reuses the dataset and evaluation helpers, but draws a deterministic, uniformly balanced stage sample with replacement each epoch. This increases update frequency for rare CVMI stages and gives the age head a balanced stage-proxy distribution. It keeps seed `42`, the multi-task regression head, macro-F1 checkpoint selection, and the baseline regularized head design. V2 writes to `backend/artifacts/mobilenetv2_v2.keras`, `mobilenetv2_v2.labels.json`, and `evaluation_metrics_v2.json`; it refuses to overwrite the baseline checkpoint unless an explicit override flag is supplied. Oversampling can overfit very small classes, so compare the V2 held-out test results with the baseline before promotion.
+
+Train and automatically evaluate V2:
+
+```powershell
+python backend\model_v2.py --train --dataset "C:\Users\Bhumi\Desktop\Aariz" --epochs 100 --batch-size 16
+```
+
+Evaluate an existing V2 checkpoint without retraining:
+
+```powershell
+python backend\model_v2.py --evaluate --dataset "C:\Users\Bhumi\Desktop\Aariz"
+```
 
 ### Optional ROI localizer
 
@@ -136,27 +155,34 @@ Evaluate the saved model on the dataset's validation and held-out test splits:
 python backend\model.py --evaluate --dataset "C:\Users\Bhumi\Desktop\Aariz"
 ```
 
-The current saved evaluation snapshot is in `backend/artifacts/evaluation_metrics.json`. It reports:
+The preserved baseline evaluation snapshot is in `backend/artifacts/evaluation_metrics.json`. It reports:
 
 | Metric | Validation | Held-out test |
 |---|---:|---:|
 | Samples | 127 | 126 |
-| Overall accuracy | 34.65% | 34.92% |
-| Macro F1 | 11.50% | 10.29% |
-| Cohen's kappa | -0.0127 | -0.0127 |
+| Overall accuracy | 44.09% | 46.03% |
+| Macro F1 | 17.71% | 19.75% |
+| Cohen's kappa | 0.0982 | 0.1115 |
 
-Held-out test accuracy by stage (support is the number of labeled images):
+Age-proxy regression metrics:
 
-| Stage | Accuracy | Support |
+| Metric | Validation | Held-out test |
 |---|---:|---:|
-| CVMI-1 | 0.00% | 4 |
-| CVMI-2 | 25.00% | 4 |
-| CVMI-3 | 0.00% | 6 |
-| CVMI-4 | 0.00% | 32 |
-| CVMI-5 | 72.88% | 59 |
-| CVMI-6 | 0.00% | 21 |
+| MAE | 2.597 years | 2.697 years |
+| RMSE | 2.842 years | 2.892 years |
 
-These are the metrics stored with the checkpoint currently in this workspace, not a performance guarantee for future runs. They show poor overall and per-stage performance, especially for CVMI-1, 3, 4, and 6. The model is not ready for clinical use. Re-run evaluation after every training run and report the resulting metrics with the checkpoint and dataset split used. The stage-wise `accuracy_percent` in the JSON is the proportion correct within that stage; the small supports for some stages make those percentages especially uncertain.
+Per-stage accuracy (support shown as validation / test counts):
+
+| Stage | Validation accuracy | Test accuracy | Support (val / test) |
+|---|---:|---:|---:|
+| CVMI-1 | 0.00% | 0.00% | 4 / 4 |
+| CVMI-2 | 0.00% | 0.00% | 8 / 4 |
+| CVMI-3 | 0.00% | 0.00% | 8 / 6 |
+| CVMI-4 | 30.00% | 31.25% | 30 / 32 |
+| CVMI-5 | 78.95% | 74.58% | 57 / 59 |
+| CVMI-6 | 10.00% | 19.05% | 20 / 21 |
+
+These are the metrics stored with the preserved baseline checkpoint, not a performance guarantee for future runs. They show poor macro F1 and no correct CVMI-1/2/3 predictions in either split, despite higher overall accuracy driven mainly by CVMI-5. The baseline is not ready for clinical use. Re-run evaluation after every training run and report the resulting metrics with the checkpoint and dataset split used. The stage-wise `accuracy_percent` in the JSON is the proportion correct within that stage; small supports make those percentages especially uncertain.
 
 The metrics JSON also contains calibration diagnostics. Kappa, Brier score, and expected calibration error are descriptive model diagnostics; they do not certify clinical reliability.
 

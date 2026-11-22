@@ -112,7 +112,7 @@ Training writes `backend/artifacts/mobilenetv2.keras` and its `.labels.json` met
 
 Train and automatically evaluate V2:
 
-```powershell sh
+```powershell
 python backend\model_v2.py --train --dataset "C:\Users\Bhumi\Desktop\Aariz" --epochs 100 --batch-size 16
 ```
 

@@ -88,7 +88,7 @@ The stable baseline uses a shared 128-unit ReLU task layer with L2 `1e-4` and dr
 
 Run from the project root:
 
-```powershell script
+```powershell
 python backend\model.py --train --dataset "C:\Users\Bhumi\Desktop\Aariz" --epochs 100 --batch-size 16
 ```
 

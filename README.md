@@ -17,6 +17,7 @@ CleftSkel-AI is a research prototype for reviewing lateral cephalogram X-rays. I
 - Growth-phase guidance and UCLP/non-cleft cohort context are presented as research notes, not individual clinical decisions.
 - ReportLab PDF dossier with image and model findings, metadata, context, and clinician-validation disclaimer.
 - `backend/create_architecture_diagram.py` generates the architecture figure at `backend/artifacts/architecture.png`.
+- `backend/evaluation_metrics_plot.py` generates validation/test plots from the saved metrics JSON and current dataset.
 
 ## Project structure
 
@@ -25,6 +26,7 @@ CleftSkel-AI/
 |-- backend/
 |   |-- artifacts/                 # Local checkpoints, metrics, generated diagram (gitignored)
 |   |-- create_architecture_diagram.py
+|   |-- evaluation_metrics_plot.py
 |   |-- main.py                    # FastAPI endpoints and PDF dossier
 |   |-- model.py                   # Stable baseline: dataset, training, evaluation, inference
 |   |-- model_v2.py                # Isolated balanced-sampling experiment and V2 artifacts
@@ -220,7 +222,15 @@ This writes `backend/artifacts/architecture.png` at 300 DPI. If Matplotlib is no
 python backend\distribution_png.py --dataset "C:\Users\Bhumi\Desktop\Aariz"
 ```
 
-This regenerates `distribution_polished.png` from the matched image/annotation records in the train, validation, and test splits. It also plots the scikit-learn class weights calculated from the training split, so the displayed counts and weights stay aligned with the current dataset.
+This writes two standalone 300-DPI, single-column figures into `backend/artifacts/`: `cvmi_stage_counts.png` (train/valid/test stage counts and split totals) and `cvmi_sample_weights.png` (the clipped square-root weights used for CVM samples). Both figures are generated from the current dataset and model weight helper. The older wide `distribution_polished.png` is retained as a legacy combined figure.
+
+## Generate the evaluation figure
+
+```powershell
+python backend\evaluation_metrics_plot.py --dataset "C:\Users\Bhumi\Desktop\Aariz"
+```
+
+This reads `backend/artifacts/evaluation_metrics.json`, checks its validation/test sample counts against the current dataset, and writes `backend/artifacts/evaluation_metrics.png`. Re-run `python backend\model.py --evaluate --dataset "C:\Users\Bhumi\Desktop\Aariz"` before plotting if the checkpoint or data split changes. The age error panel is proxy-map agreement, not clinical-age validation.
 
 ## Limitations and privacy
 

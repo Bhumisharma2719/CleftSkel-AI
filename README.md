@@ -63,7 +63,7 @@ py -m http.server 5500 --directory frontend
 
 Open `http://127.0.0.1:5500`. The frontend loads Tailwind from its CDN and therefore needs internet access for Tailwind styling.
 
-## Dataset layout
+## Dataset layout a
 
 The default dataset root is `C:\Users\Bhumi\Desktop\Aariz`. Set `CLEFTSKEL_DATASET_DIR` or pass `--dataset` to use another location. The loader expects the following layout:
 

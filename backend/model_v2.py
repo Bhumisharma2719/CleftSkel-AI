@@ -42,7 +42,8 @@ DEFAULT_STAGE_GROUPS: dict[str, dict[str, Any]] = {
     "2": {"name": "Post-Peak / Maturation Completion", "stages": [5, 6]},
 }
 TRAINING_SEED = 42
-IMAGE_SIZE = baseline.IMAGE_SIZE
+DEFAULT_IMAGE_SIZE = baseline.IMAGE_SIZE[0]
+DEFAULT_BACKBONE = "mobilenetv2"
 
 
 def _validate_stage_groups(raw: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -118,24 +119,49 @@ def _assert_no_split_overlap(splits: dict[str, list[dict[str, Any]]]) -> None:
             seen_paths[image_path] = split_name
 
 
-def _build_v2_model(num_groups: int):
-    """Build regularized MobileNetV2 with reduced-stage and proxy-age heads."""
-    tf = baseline._tensorflow()
-    inputs = tf.keras.Input(shape=(*IMAGE_SIZE, 3), name="image")
-    x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
-    backbone = tf.keras.applications.MobileNetV2(
-        input_shape=(*IMAGE_SIZE, 3), include_top=False, weights="imagenet"
-    )
-    # Fine-tune the final feature blocks only; frozen BatchNorm statistics are
-    # less noisy for this small radiograph dataset.
-    backbone.trainable = True
-    unfreeze_tail = 35
-    freeze_before = max(0, len(backbone.layers) - unfreeze_tail)
-    for layer in backbone.layers[:freeze_before]:
-        layer.trainable = False
-    for layer in backbone.layers[freeze_before:]:
-        layer.trainable = not isinstance(layer, tf.keras.layers.BatchNormalization)
+def _assert_expected_split_counts(splits: dict[str, list[dict[str, Any]]]) -> None:
+    expected = {"train": 588, "valid": 127, "test": 126}
+    actual = {name: len(splits.get(name, [])) for name in expected}
+    if actual != expected:
+        raise ValueError(
+            f"Expected the fixed Aariz split counts {expected} (N=841), found {actual}. "
+            "Check that the dataset root contains the original split folders and all annotated images."
+        )
 
+
+def _preprocess_for_backbone(tf, backbone_name: str, inputs):
+    if backbone_name == "mobilenetv2":
+        return tf.keras.applications.mobilenet_v2.preprocess_input(inputs)
+    if backbone_name in {"efficientnetb0", "efficientnetb2"}:
+        # Keras EfficientNet models include their own input rescaling.
+        return inputs
+    if backbone_name == "densenet121":
+        return tf.keras.applications.densenet.preprocess_input(inputs)
+    raise ValueError(f"Unsupported backbone: {backbone_name}")
+
+
+def _backbone_constructor(tf, backbone_name: str):
+    constructors = {
+        "mobilenetv2": tf.keras.applications.MobileNetV2,
+        "efficientnetb0": tf.keras.applications.EfficientNetB0,
+        "efficientnetb2": tf.keras.applications.EfficientNetB2,
+        "densenet121": tf.keras.applications.DenseNet121,
+    }
+    try:
+        return constructors[backbone_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported backbone {backbone_name!r}; choose from {', '.join(constructors)}") from exc
+
+
+def _build_v2_model(num_groups: int, image_size: int, backbone_name: str):
+    """Build the selected ImageNet backbone with reduced-stage and proxy-age heads."""
+    tf = baseline._tensorflow()
+    inputs = tf.keras.Input(shape=(image_size, image_size, 3), name="image")
+    x = _preprocess_for_backbone(tf, backbone_name, inputs)
+    backbone = _backbone_constructor(tf, backbone_name)(
+        input_shape=(image_size, image_size, 3), include_top=False, weights="imagenet"
+    )
+    backbone.trainable = False
     x = backbone(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     x = tf.keras.layers.Dense(
@@ -149,20 +175,34 @@ def _build_v2_model(num_groups: int):
         "cvm_stage": tf.keras.layers.Dense(num_groups, activation="softmax", name="cvm_stage")(x),
         "skeletal_age_years": tf.keras.layers.Dense(1, name="skeletal_age_years")(x),
     }
-    model = tf.keras.Model(inputs, outputs, name="mobilenetv2_reduced_cvm_age_v2")
+    model = tf.keras.Model(inputs, outputs, name=f"{backbone_name}_reduced_cvm_age_v2")
+    _compile_v2_model(model, tf, learning_rate=3e-4)
+    return model, backbone
+
+
+def _compile_v2_model(model, tf, learning_rate: float):
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=5e-5),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss={
             "cvm_stage": "sparse_categorical_crossentropy",
             "skeletal_age_years": "mean_squared_error",
         },
-        loss_weights={"cvm_stage": 1.0, "skeletal_age_years": 0.01},
+        loss_weights={"cvm_stage": 1.0, "skeletal_age_years": 0.005},
         metrics={
             "cvm_stage": ["accuracy"],
             "skeletal_age_years": ["mean_absolute_error"],
         },
     )
-    return model
+
+
+def _unfreeze_backbone_tail(backbone, tf, tail_layers: int) -> int:
+    backbone.trainable = True
+    start = max(0, len(backbone.layers) - tail_layers)
+    for layer in backbone.layers[:start]:
+        layer.trainable = False
+    for layer in backbone.layers[start:]:
+        layer.trainable = not isinstance(layer, tf.keras.layers.BatchNormalization)
+    return sum(layer.trainable for layer in backbone.layers)
 
 
 def _smoothed_group_weights(labels: list[int], num_groups: int) -> dict[int, float]:
@@ -182,11 +222,11 @@ def _make_dataset(
     records: list[dict[str, Any]],
     stage_to_group: dict[int, int],
     group_age_map: dict[int, float],
-    stage_age_map: dict[int, float],
     class_weights: dict[int, float],
     *,
     batch_size: int,
     training: bool,
+    image_size: int,
 ):
     tf = baseline._tensorflow()
     augmenter = None
@@ -204,10 +244,16 @@ def _make_dataset(
         for record in records:
             try:
                 with Image.open(record["image_path"]) as source:
-                    rgb = source.convert("RGB").resize((IMAGE_SIZE[1], IMAGE_SIZE[0]))
+                    rgb = source.convert("RGB").resize((image_size, image_size), Image.Resampling.LANCZOS)
                     pixels = np.asarray(rgb, dtype=np.float32)
                     if augmenter is not None:
                         pixels = augmenter.random_transform(pixels)
+                        # Mild photometric jitter preserves vertebral geometry.
+                        if random.random() < 0.5:
+                            pixels = np.clip(pixels * random.uniform(0.95, 1.05), 0, 255)
+                        if random.random() < 0.5:
+                            mean = pixels.mean(axis=(0, 1), keepdims=True)
+                            pixels = np.clip((pixels - mean) * random.uniform(0.94, 1.06) + mean, 0, 255)
             except (OSError, UnidentifiedImageError) as exc:
                 raise ValueError(f"Could not read image {record['image_path']}: {exc}") from exc
 
@@ -229,7 +275,7 @@ def _make_dataset(
                 yield pixels, labels
 
     output_signature = (
-        tf.TensorSpec(shape=(*IMAGE_SIZE, 3), dtype=tf.float32),
+        tf.TensorSpec(shape=(image_size, image_size, 3), dtype=tf.float32),
         {
             "cvm_stage": tf.TensorSpec(shape=(), dtype=tf.int32),
             "skeletal_age_years": tf.TensorSpec(shape=(1,), dtype=tf.float32),
@@ -254,6 +300,7 @@ def _evaluate_split(
     stage_to_group: dict[int, int],
     groups: dict[int, dict[str, Any]],
     group_age_map: dict[int, float],
+    image_size: int,
 ) -> dict[str, Any]:
     num_groups = len(groups)
     confusion = np.zeros((num_groups, num_groups), dtype=np.int64)
@@ -261,7 +308,7 @@ def _evaluate_split(
     age_predictions: list[float] = []
     for record in records:
         with Image.open(record["image_path"]) as source:
-            rgb = source.convert("RGB").resize((IMAGE_SIZE[1], IMAGE_SIZE[0]))
+            rgb = source.convert("RGB").resize((image_size, image_size), Image.Resampling.LANCZOS)
             pixels = np.asarray(rgb, dtype=np.float32)[None, ...]
         outputs = baseline._model_output_dict(model, model(pixels, training=False))
         probabilities = outputs["cvm_stage"][0]
@@ -314,6 +361,7 @@ def _evaluate_v2(
     dataset_dir: str | Path,
     model_path: str | Path,
     metrics_output: str | Path,
+    include_test: bool = True,
 ) -> dict[str, Any]:
     checkpoint = Path(model_path).expanduser().resolve()
     sidecar = checkpoint.with_suffix(".labels.json")
@@ -321,25 +369,32 @@ def _evaluate_v2(
         raise FileNotFoundError(f"V2 checkpoint and metadata are required: {checkpoint} / {sidecar}")
     splits = baseline.load_aariz_dataset(dataset_dir)
     _assert_no_split_overlap(splits)
+    _assert_expected_split_counts(splits)
     metadata = json.loads(sidecar.read_text(encoding="utf-8"))
     groups = _validate_stage_groups(metadata["stage_groups"])
     stage_to_group = _stage_to_group(groups)
     group_age_map = {int(key): float(value) for key, value in metadata["group_age_map"].items()}
+    stored_size = metadata.get("image_size", DEFAULT_IMAGE_SIZE)
+    image_size = int(stored_size[0] if isinstance(stored_size, (list, tuple)) else stored_size)
     model = baseline._tensorflow().keras.models.load_model(checkpoint, compile=False)
     results = {
-        "validation": _evaluate_split(model, splits.get("valid", []), stage_to_group, groups, group_age_map),
-        "test": _evaluate_split(model, splits.get("test", []), stage_to_group, groups, group_age_map),
+        "validation": _evaluate_split(model, splits.get("valid", []), stage_to_group, groups, group_age_map, image_size),
     }
+    if include_test:
+        results["test"] = _evaluate_split(model, splits.get("test", []), stage_to_group, groups, group_age_map, image_size)
     split_counts = {name: len(records) for name, records in splits.items()}
     result = {
         "model_path": str(checkpoint),
         "experiment": "reduced_cvm_groups_v2",
         "training_seed": metadata.get("training_seed", TRAINING_SEED),
+        "backbone": metadata.get("backbone", DEFAULT_BACKBONE),
+        "image_size": image_size,
         "stage_groups": {str(key): value for key, value in groups.items()},
         "stage_age_map": metadata.get("source_stage_age_map"),
         "group_age_map": {str(key): value for key, value in group_age_map.items()},
         "dataset_split_counts": split_counts,
         "split_integrity": "preserved original train/valid/test partitions; duplicate IDs and paths checked",
+        "test_evaluation_performed": include_test,
         "cvm": results,
         "age_metric_note": "MAE/RMSE use group-mean synthetic stage-age proxies, not observed skeletal ages.",
     }
@@ -371,14 +426,23 @@ def train_model_v2(
     stage_age_map_path: str | Path | None = None,
     epochs: int = 100,
     batch_size: int = 16,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    backbone_name: str = DEFAULT_BACKBONE,
+    unfreeze_layers: int = 35,
+    include_test_evaluation: bool = True,
 ) -> dict[str, Any]:
     """Train and evaluate the reduced-stage experiment without touching v1."""
     checkpoint = Path(output_path).expanduser().resolve()
     metrics_path = Path(metrics_output).expanduser().resolve()
     _assert_v2_paths(checkpoint, metrics_path)
+    if epochs < 2:
+        raise ValueError("Use at least 2 epochs so both head warm-up and fine-tuning phases can run.")
+    if image_size < 160 or image_size > 512 or image_size % 32 != 0:
+        raise ValueError("--image-size must be a multiple of 32 between 160 and 512 (for example 224, 256, or 320).")
     tf = baseline._set_global_training_seed(TRAINING_SEED)
     splits = baseline.load_aariz_dataset(dataset_dir)
     _assert_no_split_overlap(splits)
+    _assert_expected_split_counts(splits)
     for split_name in ("train", "valid"):
         if not splits.get(split_name):
             raise ValueError(f"V2 training requires a non-empty {split_name} split.")
@@ -393,21 +457,37 @@ def train_model_v2(
     class_weights = _smoothed_group_weights(train_group_labels, len(groups))
 
     train_ds = _make_dataset(
-        splits["train"], stage_to_group, group_age_map, source_age_map, class_weights,
-        batch_size=batch_size, training=True,
+        splits["train"], stage_to_group, group_age_map, class_weights,
+        batch_size=batch_size, training=True, image_size=image_size,
     )
     valid_ds = _make_dataset(
-        splits["valid"], stage_to_group, group_age_map, source_age_map, class_weights,
-        batch_size=batch_size, training=False,
+        splits["valid"], stage_to_group, group_age_map, class_weights,
+        batch_size=batch_size, training=False, image_size=image_size,
     )
-    model = _build_v2_model(num_groups=len(groups))
+    model, backbone = _build_v2_model(len(groups), image_size, backbone_name)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    callbacks = _validation_callbacks(
-        tf, checkpoint, valid_ds, num_groups=len(groups)
+    callbacks = _validation_callbacks(tf, checkpoint, valid_ds, num_groups=len(groups))
+    warmup_epochs = min(8, max(1, epochs // 10))
+    print(
+        f"V2 training: backbone={backbone_name}, input={image_size}x{image_size}, "
+        f"head warm-up={warmup_epochs} epochs, fine-tuning={epochs - warmup_epochs} epochs, seed={TRAINING_SEED}",
+        flush=True,
     )
     model.fit(
         train_ds,
         validation_data=valid_ds,
+        epochs=warmup_epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    trainable_count = _unfreeze_backbone_tail(backbone, tf, unfreeze_layers)
+    _compile_v2_model(model, tf, learning_rate=1e-5)
+    print(f"Fine-tuning {trainable_count} backbone layers with Adam lr=1e-5", flush=True)
+    model.fit(
+        train_ds,
+        validation_data=valid_ds,
+        initial_epoch=warmup_epochs,
         epochs=epochs,
         callbacks=callbacks,
         verbose=1,
@@ -424,21 +504,25 @@ def train_model_v2(
         "has_skeletal_age_head": True,
         "skeletal_age_head_architecture": "parallel_dense_regression",
         "age_target_source": "synthetic_grouped_stage_mapping",
-        "image_size": list(IMAGE_SIZE),
+        "image_size": image_size,
         "training_seed": TRAINING_SEED,
         "experiment": "reduced_cvm_groups_v2",
         "split_integrity": "original Aariz train/valid/test partitions preserved; overlap check passed",
         "class_weights": {str(key): value for key, value in class_weights.items()},
         "class_weight_formula": "sqrt(N / (K * group_count)), clipped to [0.5, 2.5]",
+        "backbone": backbone_name,
         "task_head": {"dense_units": 128, "dropout": 0.40, "l2_kernel_regularization": 1e-4},
         "losses": {"cvm_stage": "sparse_categorical_crossentropy", "skeletal_age_years": "mean_squared_error"},
-        "loss_weights": {"cvm_stage": 1.0, "skeletal_age_years": 0.01},
+        "loss_weights": {"cvm_stage": 1.0, "skeletal_age_years": 0.005},
         "fine_tuning": {
-            "backbone": "MobileNetV2 ImageNet weights",
-            "backbone_top_layers_selected": 35,
+            "backbone": f"{backbone_name} ImageNet weights",
+            "strategy": "frozen-backbone head warm-up then top-layer fine-tuning",
+            "warmup_epochs": warmup_epochs,
+            "backbone_top_layers_selected": unfreeze_layers,
             "batch_normalization_trainable": False,
             "optimizer": "Adam",
-            "learning_rate": 5e-5,
+            "warmup_learning_rate": 3e-4,
+            "fine_tuning_learning_rate": 1e-5,
             "checkpoint_monitor": "val_cvm_balanced_accuracy",
             "reduce_lr_monitor": "val_cvm_stage_loss",
         },
@@ -448,12 +532,14 @@ def train_model_v2(
             "height_shift": 0.05,
             "zoom": 0.08,
             "horizontal_flip": False,
+            "brightness_jitter": 0.05,
+            "contrast_jitter": 0.06,
         },
         "roi_training_source": None,
         "dataset_dir": str(Path(dataset_dir).resolve()),
     }
     checkpoint.with_suffix(".labels.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    evaluation = _evaluate_v2(dataset_dir, checkpoint, metrics_path)
+    evaluation = _evaluate_v2(dataset_dir, checkpoint, metrics_path, include_test=include_test_evaluation)
     return {
         "status": "trained_and_evaluated",
         "model_path": str(checkpoint),
@@ -461,6 +547,8 @@ def train_model_v2(
         "dataset_split_counts": {key: len(value) for key, value in splits.items()},
         "stage_groups": metadata["stage_groups"],
         "group_age_map": metadata["group_age_map"],
+        "backbone": backbone_name,
+        "image_size": image_size,
         "evaluation": evaluation["cvm"],
     }
 
@@ -495,12 +583,21 @@ def _validation_callbacks(tf, checkpoint: Path, valid_ds, num_groups: int):
                 flush=True,
             )
 
+    class BestBalancedCheckpoint(tf.keras.callbacks.Callback):
+        def __init__(self):
+            super().__init__()
+            self.best = -np.inf
+
+        def on_epoch_end(self, epoch, logs=None):
+            score = (logs or {}).get("val_cvm_balanced_accuracy")
+            if score is not None and np.isfinite(score) and float(score) > self.best:
+                self.best = float(score)
+                self.model.save(checkpoint)
+                print(f"Saved best balanced-validation checkpoint ({self.best:.4f}) to {checkpoint}", flush=True)
+
     return [
         ReducedStageValidationMetrics(),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(checkpoint), monitor="val_cvm_balanced_accuracy", mode="max",
-            save_best_only=True, save_weights_only=False, verbose=1,
-        ),
+        BestBalancedCheckpoint(),
         tf.keras.callbacks.EarlyStopping(
             monitor="val_cvm_balanced_accuracy", mode="max", patience=20,
             restore_best_weights=True, verbose=1,
@@ -513,7 +610,7 @@ def _validation_callbacks(tf, checkpoint: Path, valid_ds, num_groups: int):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Isolated reduced-stage CVM MobileNetV2 experiment (V2).")
+    parser = argparse.ArgumentParser(description="Isolated reduced-stage CVM multi-backbone experiment (V2).")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--train", action="store_true", help="Train V2 and evaluate its validation/test splits.")
     action.add_argument("--evaluate", action="store_true", help="Evaluate the selected V2 checkpoint.")
@@ -524,6 +621,10 @@ def main() -> None:
     parser.add_argument("--stage-age-map", help="Optional source CVMI-to-age JSON; defaults to project stage_age_map.json.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--backbone", choices=("mobilenetv2", "efficientnetb0", "efficientnetb2", "densenet121"), default=DEFAULT_BACKBONE)
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE, help="Square input resolution; use a multiple of 32, e.g. 224, 256, 320.")
+    parser.add_argument("--unfreeze-layers", type=int, default=35, help="Number of final backbone layers made trainable in fine-tuning.")
+    parser.add_argument("--validation-only", action="store_true", help="After training, report validation metrics only (use when comparing variants; run --evaluate once for the final test report).")
     parser.add_argument("--show-stage-groups", action="store_true", help="Print and exit with the default grouping.")
     args = parser.parse_args()
 
@@ -551,6 +652,10 @@ def main() -> None:
             stage_age_map_path=age_path,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            image_size=args.image_size,
+            backbone_name=args.backbone,
+            unfreeze_layers=args.unfreeze_layers,
+            include_test_evaluation=not args.validation_only,
         )
     else:
         result = _evaluate_v2(args.dataset, checkpoint, metrics_path)

@@ -153,14 +153,44 @@ def _backbone_constructor(tf, backbone_name: str):
         raise ValueError(f"Unsupported backbone {backbone_name!r}; choose from {', '.join(constructors)}") from exc
 
 
+def _load_efficientnet_backbone(tf, backbone_name: str, image_size: int):
+    """Load official EfficientNet weights after a 3-channel model is built.
+
+    Keras 3.11 / TensorFlow 2.20 in the current environment builds the stem
+    with a one-channel kernel when ``weights='imagenet'`` is passed directly,
+    although the requested input is RGB. Building first with ``weights=None``
+    and then loading the official top-free weights avoids that incompatibility.
+    """
+    specs = {
+        "efficientnetb0": ("efficientnetb0_notop.h5", "50bc09e76180e00e4465e1a485ddc09d"),
+        "efficientnetb2": ("efficientnetb2_notop.h5", "111f8e2ac8aa800a7a99e3239f7bfb39"),
+    }
+    filename, md5 = specs[backbone_name]
+    model = _backbone_constructor(tf, backbone_name)(
+        input_shape=(image_size, image_size, 3), include_top=False, weights=None
+    )
+    weights_path = tf.keras.utils.get_file(
+        filename,
+        origin=f"https://storage.googleapis.com/keras-applications/{filename}",
+        cache_subdir="models",
+        file_hash=md5,
+        hash_algorithm="md5",
+    )
+    model.load_weights(weights_path)
+    return model
+
+
 def _build_v2_model(num_groups: int, image_size: int, backbone_name: str):
     """Build the selected ImageNet backbone with reduced-stage and proxy-age heads."""
     tf = baseline._tensorflow()
     inputs = tf.keras.Input(shape=(image_size, image_size, 3), name="image")
     x = _preprocess_for_backbone(tf, backbone_name, inputs)
-    backbone = _backbone_constructor(tf, backbone_name)(
-        input_shape=(image_size, image_size, 3), include_top=False, weights="imagenet"
-    )
+    if backbone_name in {"efficientnetb0", "efficientnetb2"}:
+        backbone = _load_efficientnet_backbone(tf, backbone_name, image_size)
+    else:
+        backbone = _backbone_constructor(tf, backbone_name)(
+            input_shape=(image_size, image_size, 3), include_top=False, weights="imagenet"
+        )
     backbone.trainable = False
     x = backbone(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
